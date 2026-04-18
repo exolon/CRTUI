@@ -8,6 +8,7 @@ import com.jcraft.jsch.UserInfo
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
 enum class SessionType { LOCAL, SSH }
@@ -24,11 +25,32 @@ class TerminalSession(var name: String, val type: SessionType, val sshConfig: Ss
     private var shellChannel: ChannelShell? = null
     private var sshOut: java.io.OutputStream? = null
 
-    // Regex to match standard ANSI escape sequences (colors, cursor movements, mode toggles)
     private val ansiRegex = Regex("\u001B\\[[;\\d?]*[a-zA-Z]")
+
+    // Maps Notification IDs to their specific line in the history array for live updating
+    private val notifIndexMap = ConcurrentHashMap<Int, Int>()
 
     fun getPrompt(): String {
         return if (type == SessionType.LOCAL) "LOCAL // ${cwd.name} > " else "${sshConfig?.user}@${sshConfig?.host} > "
+    }
+
+    fun handleNotification(id: Int, line: String) {
+        if (id != -1 && notifIndexMap.containsKey(id)) {
+            val index = notifIndexMap[id]!!
+            if (index < history.size) {
+                history[index] = line
+                return
+            }
+        }
+        history.add(line)
+        if (id != -1) {
+            notifIndexMap[id] = history.size - 1
+        }
+    }
+
+    fun clearHistory() {
+        history.clear()
+        notifIndexMap.clear()
     }
 
     fun connectSsh(onUpdate: () -> Unit) {
@@ -84,8 +106,6 @@ class TerminalSession(var name: String, val type: SessionType, val sshConfig: Ss
                 jschSession!!.connect(10000)
 
                 shellChannel = jschSession!!.openChannel("shell") as ChannelShell
-
-                // Downgrade from xterm to dumb to prevent the server from trying to send complex colors
                 shellChannel!!.setPtyType("dumb")
                 shellChannel!!.setPty(true)
 
@@ -99,7 +119,6 @@ class TerminalSession(var name: String, val type: SessionType, val sshConfig: Ss
                 val reader = BufferedReader(InputStreamReader(sshIn))
                 var line: String?
                 while (reader.readLine().also { line = it } != null) {
-                    // Scrub the line of any lingering ANSI codes before adding it to the UI
                     val cleanLine = line!!.replace(ansiRegex, "")
                     history.add(cleanLine)
                     onUpdate()
