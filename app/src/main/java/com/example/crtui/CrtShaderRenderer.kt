@@ -33,15 +33,17 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
         uniform vec3 uBgColor; 
         uniform vec3 uTextColor; 
         uniform float uGlowIntensity;
+        uniform int uEnableScanlines;
 
         void main() {
             vec4 textCol = texture2D(uTexture, vTexCoord);
             
-            // Base background with subtle scanline modulation
-            float scanline = sin(vTexCoord.y * 1200.0) * 0.03;
+            float scanline = 0.0;
+            if (uEnableScanlines == 1) {
+                scanline = sin(vTexCoord.y * 1200.0) * 0.03;
+            }
             vec3 baseColor = uBgColor - scanline;
 
-            // Gaussian-style bloom sampling adjacent pixels
             float bloom = 0.0;
             float offset = 0.003;
             bloom += texture2D(uTexture, vTexCoord + vec2(offset, 0.0)).a;
@@ -53,9 +55,12 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
             bloom += texture2D(uTexture, vTexCoord + vec2(offset, -offset)).a;
             bloom += texture2D(uTexture, vTexCoord + vec2(-offset, offset)).a;
 
-            // Combine text, background, and the glowing halo
             vec3 finalColor = mix(baseColor, textCol.rgb, textCol.a);
             finalColor += uTextColor * (bloom * 0.15 * uGlowIntensity);
+            
+            if (uEnableScanlines == 1) {
+                finalColor -= scanline;
+            }
             
             gl_FragColor = vec4(finalColor, 1.0);
         }
@@ -68,12 +73,12 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
     private var bgColorHandle = 0
     private var textColorHandle = 0
     private var glowHandle = 0
+    private var scanlinesHandle = 0
     private val textureId = IntArray(1)
 
     private val vertexBuffer: FloatBuffer
     private val texCoordBuffer: FloatBuffer
 
-    // FIX: Restored the geometry coordinates defining the screen
     private val cubeCoords = floatArrayOf(-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f)
     private val textureCoords = floatArrayOf(0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f)
 
@@ -81,7 +86,8 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
 
     var currentBgColor = floatArrayOf(0.04f, 0.12f, 0.04f)
     var currentTextColor = floatArrayOf(0.2f, 1.0f, 0.0f)
-    var glowIntensity = 1.0f
+    var glowIntensity = 0.6f
+    var isScanlinesEnabled = true
 
     private var terminalBitmap: Bitmap? = null
     private var internalCanvas: Canvas? = null
@@ -109,6 +115,7 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
         bgColorHandle = GLES20.glGetUniformLocation(programHandle, "uBgColor")
         textColorHandle = GLES20.glGetUniformLocation(programHandle, "uTextColor")
         glowHandle = GLES20.glGetUniformLocation(programHandle, "uGlowIntensity")
+        scanlinesHandle = GLES20.glGetUniformLocation(programHandle, "uEnableScanlines")
 
         GLES20.glGenTextures(1, textureId, 0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId[0])
@@ -150,6 +157,7 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
         GLES20.glUniform3f(bgColorHandle, currentBgColor[0], currentBgColor[1], currentBgColor[2])
         GLES20.glUniform3f(textColorHandle, currentTextColor[0], currentTextColor[1], currentTextColor[2])
         GLES20.glUniform1f(glowHandle, glowIntensity)
+        GLES20.glUniform1i(scanlinesHandle, if (isScanlinesEnabled) 1 else 0)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId[0])

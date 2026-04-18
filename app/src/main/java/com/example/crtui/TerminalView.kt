@@ -48,7 +48,6 @@ class TerminalView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    // --- ARCHITECTURE: MULTI-SESSION ENGINE ---
     enum class SessionType { LOCAL, SSH }
 
     data class SshConfig(val name: String, val user: String, val host: String, val port: Int)
@@ -69,13 +68,13 @@ class TerminalView @JvmOverloads constructor(
 
     private fun activeSession(): TerminalSession = sessions[activeTabIndex]
 
-    // --- THEME ENGINE ---
     enum class TerminalTheme { GREEN, LUMON, AMBER }
 
     private var currentTheme = TerminalTheme.LUMON
     private var currentTextColor = Color.parseColor("#00E5FF")
     private var currentTextSize = 37f
     private var currentGlowIntensity = 0.6f
+    private var isScanlinesEnabled = true
 
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = currentTextColor
@@ -124,7 +123,7 @@ class TerminalView @JvmOverloads constructor(
     private enum class CommandMode { NORMAL, APPS, ALIASES }
     private var currentCommandMode = CommandMode.NORMAL
 
-    private enum class OverlayState { NONE, FAVORITES, NEW_TAB_PROMPT, SSH_HOSTS }
+    private enum class OverlayState { NONE, FAVORITES, NEW_TAB_PROMPT, SSH_HOSTS, MANUAL }
     @Volatile private var currentOverlay = OverlayState.NONE
 
     @Volatile private var tabHitboxes: Map<Int, RectF> = emptyMap()
@@ -145,12 +144,35 @@ class TerminalView @JvmOverloads constructor(
     }
     private val savedSshHosts = CopyOnWriteArrayList<SshConfig>()
 
+    private val manualLines = listOf(
+        "<bold>INTERFACE & NAVIGATION</bold>",
+        "• Tabs: Double-tap to close. Tap [+] for new session.",
+        "• Overlays: Tap [Favs] for Favorites, [*] for Settings.",
+        "• Keys: Use [Tab] to autocomplete Apps and Favs.",
+        " ",
+        "<bold>CORE COMMANDS</bold>",
+        "• s [query]: System-wide web search.",
+        "• fav -add/rm: Manage the Favorite Apps overlay.",
+        "• alias x=y: Map custom execution macros.",
+        "• dnd: Toggle Android Do-Not-Disturb mode.",
+        "• wifi: Open native Network panel.",
+        " ",
+        "<bold>FILE SYSTEM & UTILS</bold>",
+        "• ls, cd, pwd, mkdir, rm: Local file navigation.",
+        "• note [text]: Append strings to local note buffer.",
+        "• read: Display local note buffer.",
+        "• ping [ip]: Test ICMP packet latency."
+    )
+
     private var scrollOffset = 0f
     private var forceScrollToBottom = true
 
+    // --- TOUCH ENGINE FIX ---
+    private var initialTouchX = 0f
     private var initialTouchY = 0f
+    private var lastTouchY = 0f
     private var isDragging = false
-    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+    private val touchSlop = max(15f, ViewConfiguration.get(context).scaledTouchSlop.toFloat())
     private val scrollSpeedMultiplier = 1.5f
 
     private var lastTabTapTime = 0L
@@ -237,6 +259,7 @@ class TerminalView @JvmOverloads constructor(
         this.shaderRenderer = renderer
         applyTheme(currentTheme)
         renderer.glowIntensity = currentGlowIntensity
+        renderer.isScanlinesEnabled = isScanlinesEnabled
     }
 
     private fun requestUpdate() {
@@ -370,14 +393,6 @@ class TerminalView @JvmOverloads constructor(
     override fun onDraw(canvas: Canvas) {}
 
     fun renderContentForTexture(canvas: Canvas) {
-        if (currentState == AppState.SETTINGS) {
-            renderSettings(canvas)
-            return
-        }
-
-        val session = activeSession()
-        val startX = paddingLeft + 40f
-        val maxWidth = width - paddingLeft - paddingRight - 80f
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
 
@@ -387,6 +402,18 @@ class TerminalView @JvmOverloads constructor(
 
         val textTopLimit = paddingTop + 80f
         val textBottomLimit = commandBarY - textHeight - 20f
+
+        if (currentState == AppState.SETTINGS) {
+            renderSettings(canvas)
+            if (currentOverlay != OverlayState.NONE) {
+                drawOverlayWindow(canvas, textBottomLimit)
+            }
+            return
+        }
+
+        val session = activeSession()
+        val startX = paddingLeft + 40f
+        val maxWidth = width - paddingLeft - paddingRight - 80f
         val visibleHeight = textBottomLimit - textTopLimit
 
         val totalHeight = getTotalTextHeight(maxWidth)
@@ -429,7 +456,6 @@ class TerminalView @JvmOverloads constructor(
             val time = System.currentTimeMillis()
             val pulseAlpha = ((Math.sin(time / 300.0) + 1.0) / 2.0 * 255).toInt()
             textPaint.alpha = pulseAlpha
-
             canvas.drawRect(cX + 2f, cY + fontMetrics.ascent + 5f, cX + 22f, cY + fontMetrics.descent - 5f, textPaint)
             textPaint.alpha = 255
         }
@@ -461,7 +487,11 @@ class TerminalView @JvmOverloads constructor(
             else -> 1
         }
 
-        val neededHeight = (textHeight * 1.5f) * (itemCount + 3)
+        val neededHeight = when (currentOverlay) {
+            OverlayState.MANUAL -> (maxBottomY - 20f) - topY
+            else -> (textHeight * 1.5f) * (itemCount + 3)
+        }
+
         val bottomY = min(topY + neededHeight, maxBottomY - 20f)
         val windowRect = RectF(leftX, topY, rightX, bottomY)
 
@@ -472,6 +502,7 @@ class TerminalView @JvmOverloads constructor(
             OverlayState.FAVORITES -> " FAVORITE APPS "
             OverlayState.NEW_TAB_PROMPT -> " ESTABLISH NEW CONNECTION "
             OverlayState.SSH_HOSTS -> " SECURE SHELL HOSTS "
+            OverlayState.MANUAL -> " USER MANUAL v0.5.0 "
             else -> " OVERLAY "
         }
         canvas.drawText(title, leftX + 20f, currentY, boldTextPaint)
@@ -528,6 +559,17 @@ class TerminalView @JvmOverloads constructor(
                 canvas.drawText(addText, leftX + 20f, currentY, boldTextPaint)
                 newHitboxes["add_ssh"] = RectF(leftX, currentY - textHeight, rightX, currentY + fontMetrics.descent)
             }
+            OverlayState.MANUAL -> {
+                val manualMaxWidth = rightX - leftX - 40f
+                canvas.save()
+                canvas.clipRect(leftX + 5f, currentY - textHeight, rightX - 5f, bottomY - 5f)
+                for (line in manualLines) {
+                    if (currentY > bottomY - textHeight) break
+                    val metrics = drawAndMeasureWrappedText(canvas, line, leftX + 20f, currentY, manualMaxWidth, bottomY - 10f)
+                    currentY = metrics.nextY - (textHeight * 0.5f)
+                }
+                canvas.restore()
+            }
             else -> {}
         }
 
@@ -567,6 +609,14 @@ class TerminalView @JvmOverloads constructor(
         newSettings["glow_plus"] = RectF(tempX - touchPad, currentY - textHeight - touchPad, tempX + textPaint.measureText(gPlusBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
         currentY += textHeight * 1.5f
 
+        val scanlineLabel = "Scanlines: "
+        canvas.drawText(scanlineLabel, startX, currentY, textPaint)
+        val scanBtn = if (isScanlinesEnabled) "[ ENABLED ]" else "[ DISABLED ]"
+        val scanX = startX + textPaint.measureText(scanlineLabel)
+        canvas.drawText(scanBtn, scanX, currentY, boldTextPaint)
+        newSettings["toggle_scanlines"] = RectF(scanX - touchPad, currentY - textHeight - touchPad, scanX + textPaint.measureText(scanBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
+        currentY += textHeight * 1.5f
+
         val fontLabel = "Font Size: ${currentTextSize.toInt()}  "
         canvas.drawText(fontLabel, startX, currentY, textPaint)
         tempX = startX + textPaint.measureText(fontLabel)
@@ -580,6 +630,11 @@ class TerminalView @JvmOverloads constructor(
         canvas.drawText(plusBtn, tempX, currentY, boldTextPaint)
         newSettings["font_plus"] = RectF(tempX - touchPad, currentY - textHeight - touchPad, tempX + textPaint.measureText(plusBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
         currentY += textHeight * 2.5f
+
+        val manualBtn = "[ VIEW SYSTEM MANUAL ]"
+        canvas.drawText(manualBtn, startX, currentY, boldTextPaint)
+        newSettings["open_manual"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(manualBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
+        currentY += textHeight * 1.5f
 
         val exportBtn = "[ EXPORT SETTINGS ]"
         canvas.drawText(exportBtn, startX, currentY, boldTextPaint)
@@ -611,8 +666,7 @@ class TerminalView @JvmOverloads constructor(
         newSettings["add_alias"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(addBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
         currentY += textHeight * 3f
 
-        // VERSION & GITHUB LINK
-        val repoText = "[ GitHub: exolon/CRTUI v0.5.0 ]"
+        val repoText = "VERSION v0.5.0 :: [ GitHub: exolon/CRTUI ]"
         canvas.drawText(repoText, startX, currentY, promptTextPaint)
         newSettings["github_link"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(repoText) + touchPad, currentY + fontMetrics.descent + touchPad)
         currentY += textHeight * 3f
@@ -629,7 +683,7 @@ class TerminalView @JvmOverloads constructor(
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
         var currentX = paddingLeft + 40f
-        val touchPad = 15f
+        val touchPad = 10f
 
         for ((index, session) in sessions.withIndex()) {
             val displayText = " ${session.name} "
@@ -665,7 +719,7 @@ class TerminalView @JvmOverloads constructor(
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
         var currentX = paddingLeft + 40f
-        val touchPad = 10f
+        val touchPad = 5f
 
         val keys = listOf("Tab", "CTRL+C", "<", ">", "^", "v", "/", "-", "=")
 
@@ -676,7 +730,7 @@ class TerminalView @JvmOverloads constructor(
 
             newKeys[key] = rect
             canvas.drawText(displayText, currentX, yPos, textPaint)
-            currentX += textWidth + 15f
+            currentX += textWidth + 10f
         }
         extraKeyHitboxes = newKeys
     }
@@ -686,7 +740,7 @@ class TerminalView @JvmOverloads constructor(
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
         var currentX = paddingLeft + 40f
-        val touchPad = 10f
+        val touchPad = 5f
 
         val session = activeSession()
         val itemsToDraw = when (currentCommandMode) {
@@ -699,12 +753,13 @@ class TerminalView @JvmOverloads constructor(
                 val filterText = session.buffer.lowercase()
                 aliases.keys.filter { it.lowercase().contains(filterText) }.take(4).toList()
             }
+            else -> listOf()
         }
 
         val rowPrefix = when (currentCommandMode) {
             CommandMode.NORMAL -> "CMD: "
             CommandMode.APPS -> "APP: "
-            CommandMode.ALIASES -> "ALS: "
+            else -> "ALS: "
         }
 
         canvas.drawText(rowPrefix, currentX, commandBarY, promptTextPaint)
@@ -717,7 +772,7 @@ class TerminalView @JvmOverloads constructor(
 
             newCmds[item] = rect
             canvas.drawText(displayText, currentX, commandBarY, textPaint)
-            currentX += textWidth + 25f
+            currentX += textWidth + 20f
         }
         commandHitboxes = newCmds
     }
@@ -748,6 +803,7 @@ class TerminalView @JvmOverloads constructor(
             data.appendLine("Theme: ${currentTheme.name}")
             data.appendLine("FontSize: $currentTextSize")
             data.appendLine("GlowIntensity: $currentGlowIntensity")
+            data.appendLine("Scanlines: $isScanlinesEnabled")
             data.appendLine("--- ALIASES ---")
             for ((key, value) in aliases) {
                 data.appendLine("$key=$value")
@@ -769,15 +825,23 @@ class TerminalView @JvmOverloads constructor(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
+                initialTouchX = event.x
                 initialTouchY = event.y
+                lastTouchY = event.y
                 isDragging = false
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                val deltaY = initialTouchY - event.y
-                if (abs(deltaY) > touchSlop && currentState == AppState.TERMINAL) {
-                    isDragging = true
+                val dx = abs(event.x - initialTouchX)
+                val dy = abs(event.y - initialTouchY)
 
+                // Strictly separate drag threshold from the scroll tracker
+                if (dx > touchSlop || dy > touchSlop) {
+                    isDragging = true
+                }
+
+                if (isDragging && currentState == AppState.TERMINAL && currentOverlay == OverlayState.NONE) {
+                    val scrollDelta = lastTouchY - event.y
                     val fontMetrics = textPaint.fontMetrics
                     val textHeight = fontMetrics.descent - fontMetrics.ascent
                     val maxWidth = width - paddingLeft - paddingRight - 80f
@@ -786,16 +850,21 @@ class TerminalView @JvmOverloads constructor(
                     val totalHeight = getTotalTextHeight(maxWidth)
                     val maxScroll = max(0f, totalHeight - visibleArea)
 
-                    scrollOffset = (scrollOffset + (deltaY * scrollSpeedMultiplier)).coerceIn(0f, maxScroll)
-                    initialTouchY = event.y
+                    scrollOffset = (scrollOffset + (scrollDelta * scrollSpeedMultiplier)).coerceIn(0f, maxScroll)
+                    lastTouchY = event.y
                     requestUpdate()
                 }
                 return true
             }
             MotionEvent.ACTION_UP -> {
                 performClick()
-                if (!isDragging) {
-                    if (currentState == AppState.SETTINGS) {
+                val dx = abs(event.x - initialTouchX)
+                val dy = abs(event.y - initialTouchY)
+
+                if (!isDragging && dx <= touchSlop && dy <= touchSlop) {
+                    if (currentOverlay != OverlayState.NONE) {
+                        handleOverlayTap(event.x, event.y)
+                    } else if (currentState == AppState.SETTINGS) {
                         handleSettingsTap(event.x, event.y)
                     } else {
                         handleTap(event.x, event.y)
@@ -805,6 +874,61 @@ class TerminalView @JvmOverloads constructor(
             }
         }
         return super.onTouchEvent(event)
+    }
+
+    private fun handleOverlayTap(touchX: Float, touchY: Float) {
+        var windowActionTaken = false
+        for ((action, rect) in overlayHitboxes) {
+            if (rect.contains(touchX, touchY)) {
+                when (currentOverlay) {
+                    OverlayState.FAVORITES -> {
+                        if (action == "close") currentOverlay = OverlayState.NONE
+                        else if (action.startsWith("launch_")) {
+                            launchApp(action.removePrefix("launch_"))
+                            currentOverlay = OverlayState.NONE
+                            currentState = AppState.TERMINAL
+                        }
+                    }
+                    OverlayState.NEW_TAB_PROMPT -> {
+                        if (action == "close") currentOverlay = OverlayState.NONE
+                        else if (action == "new_local") {
+                            sessions.add(TerminalSession("Local", SessionType.LOCAL))
+                            activeTabIndex = sessions.size - 1
+                            currentOverlay = OverlayState.NONE
+                        }
+                        else if (action == "new_remote") {
+                            currentOverlay = OverlayState.SSH_HOSTS
+                        }
+                    }
+                    OverlayState.SSH_HOSTS -> {
+                        if (action == "close") currentOverlay = OverlayState.NONE
+                        else if (action == "add_ssh") {
+                            activeSession().history.add("> SSH Configurator locked. Awaiting backend.")
+                            currentOverlay = OverlayState.NONE
+                        }
+                        else if (action.startsWith("connect_ssh_")) {
+                            val hostIndex = action.removePrefix("connect_ssh_").toIntOrNull()
+                            if (hostIndex != null && hostIndex < savedSshHosts.size) {
+                                val config = savedSshHosts[hostIndex]
+                                sessions.add(TerminalSession(config.name, SessionType.SSH, config))
+                                activeTabIndex = sessions.size - 1
+                            }
+                            currentOverlay = OverlayState.NONE
+                        }
+                    }
+                    OverlayState.MANUAL -> {
+                        if (action == "close") currentOverlay = OverlayState.NONE
+                    }
+                    else -> {}
+                }
+                windowActionTaken = true
+                break
+            }
+        }
+        if (windowActionTaken) {
+            scrollToBottom()
+            requestUpdate()
+        }
     }
 
     private fun handleSettingsTap(touchX: Float, touchY: Float) {
@@ -827,6 +951,10 @@ class TerminalView @JvmOverloads constructor(
                             shaderRenderer?.glowIntensity = currentGlowIntensity
                         }
                     }
+                    action == "toggle_scanlines" -> {
+                        isScanlinesEnabled = !isScanlinesEnabled
+                        shaderRenderer?.isScanlinesEnabled = isScanlinesEnabled
+                    }
                     action == "font_minus" -> {
                         if (currentTextSize > 20f) {
                             currentTextSize -= 2f
@@ -838,6 +966,9 @@ class TerminalView @JvmOverloads constructor(
                             currentTextSize += 2f
                             updatePaintSizes()
                         }
+                    }
+                    action == "open_manual" -> {
+                        currentOverlay = OverlayState.MANUAL
                     }
                     action == "export" -> {
                         exportSettings()
@@ -859,8 +990,10 @@ class TerminalView @JvmOverloads constructor(
                         session.cursor = 6
                         scrollToBottom()
                         requestFocus()
-                        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                        imm.showSoftInput(this, 0)
+                        post {
+                            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                            imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+                        }
                     }
                     action == "exit" -> {
                         currentState = AppState.TERMINAL
@@ -875,60 +1008,6 @@ class TerminalView @JvmOverloads constructor(
     }
 
     private fun handleTap(touchX: Float, touchY: Float) {
-        val session = activeSession()
-
-        if (currentOverlay != OverlayState.NONE) {
-            var windowActionTaken = false
-            for ((action, rect) in overlayHitboxes) {
-                if (rect.contains(touchX, touchY)) {
-                    when (currentOverlay) {
-                        OverlayState.FAVORITES -> {
-                            if (action == "close") currentOverlay = OverlayState.NONE
-                            else if (action.startsWith("launch_")) {
-                                launchApp(action.removePrefix("launch_"))
-                                currentOverlay = OverlayState.NONE
-                            }
-                        }
-                        OverlayState.NEW_TAB_PROMPT -> {
-                            if (action == "close") currentOverlay = OverlayState.NONE
-                            else if (action == "new_local") {
-                                sessions.add(TerminalSession("Local", SessionType.LOCAL))
-                                activeTabIndex = sessions.size - 1
-                                currentOverlay = OverlayState.NONE
-                            }
-                            else if (action == "new_remote") {
-                                currentOverlay = OverlayState.SSH_HOSTS
-                            }
-                        }
-                        OverlayState.SSH_HOSTS -> {
-                            if (action == "close") currentOverlay = OverlayState.NONE
-                            else if (action == "add_ssh") {
-                                session.history.add("> SSH Configurator locked. Awaiting backend.")
-                                currentOverlay = OverlayState.NONE
-                            }
-                            else if (action.startsWith("connect_ssh_")) {
-                                val hostIndex = action.removePrefix("connect_ssh_").toIntOrNull()
-                                if (hostIndex != null && hostIndex < savedSshHosts.size) {
-                                    val config = savedSshHosts[hostIndex]
-                                    sessions.add(TerminalSession(config.name, SessionType.SSH, config))
-                                    activeTabIndex = sessions.size - 1
-                                }
-                                currentOverlay = OverlayState.NONE
-                            }
-                        }
-                        else -> {}
-                    }
-                    windowActionTaken = true
-                    break
-                }
-            }
-            if (windowActionTaken) {
-                scrollToBottom()
-                requestUpdate()
-            }
-            return
-        }
-
         var actionTaken = false
 
         if (settingsTabHitbox?.contains(touchX, touchY) == true) {
@@ -947,6 +1026,7 @@ class TerminalView @JvmOverloads constructor(
             return
         }
 
+        val session = activeSession()
         for ((key, rect) in extraKeyHitboxes) {
             if (rect.contains(touchX, touchY)) {
                 when (key) {
@@ -1068,8 +1148,10 @@ class TerminalView @JvmOverloads constructor(
         if (!actionTaken) {
             currentCommandMode = CommandMode.NORMAL
             requestFocus()
-            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            imm.showSoftInput(this, 0)
+            post {
+                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+            }
         }
 
         requestUpdate()
