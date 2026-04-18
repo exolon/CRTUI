@@ -21,6 +21,7 @@ import android.os.Environment
 import android.provider.Settings
 import android.text.InputType
 import android.util.AttributeSet
+import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
@@ -38,7 +39,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -48,26 +48,12 @@ class TerminalView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    enum class SessionType { LOCAL, SSH }
-
-    data class SshConfig(val name: String, val user: String, val host: String, val port: Int)
-
-    class TerminalSession(var name: String, val type: SessionType, val sshConfig: SshConfig? = null) {
-        val history = CopyOnWriteArrayList<String>(listOf("> Session established: $name"))
-        var buffer = ""
-        var cursor = 0
-        var cwd: File = Environment.getExternalStorageDirectory()
-
-        fun getPrompt(): String {
-            return if (type == SessionType.LOCAL) "LOCAL // ${cwd.name} > " else "${sshConfig?.user}@${sshConfig?.host} > "
-        }
-    }
-
     private val sessions = CopyOnWriteArrayList<TerminalSession>()
     private var activeTabIndex = 0
 
     private fun activeSession(): TerminalSession = sessions[activeTabIndex]
 
+    // --- THEME ENGINE ---
     enum class TerminalTheme { GREEN, LUMON, AMBER }
 
     private var currentTheme = TerminalTheme.LUMON
@@ -123,8 +109,13 @@ class TerminalView @JvmOverloads constructor(
     private enum class CommandMode { NORMAL, APPS, ALIASES }
     private var currentCommandMode = CommandMode.NORMAL
 
-    private enum class OverlayState { NONE, FAVORITES, NEW_TAB_PROMPT, SSH_HOSTS, MANUAL }
+    private enum class OverlayState { NONE, FAVORITES, NEW_TAB_PROMPT, SSH_HOSTS, MANUAL, ADD_SSH_HOST }
     @Volatile private var currentOverlay = OverlayState.NONE
+
+    // --- TUI FORM STATE ---
+    private val sshFormLabels = listOf("Name: ", "User: ", "Host/IP: ", "Port: ", "Pass: ")
+    private var sshFormValues = MutableList(5) { "" }
+    private var sshFormActiveField = 0
 
     @Volatile private var tabHitboxes: Map<Int, RectF> = emptyMap()
     @Volatile private var settingsTabHitbox: RectF? = null
@@ -142,6 +133,7 @@ class TerminalView @JvmOverloads constructor(
         put("grind", "dnd")
         put("home", "cd ..")
     }
+
     private val savedSshHosts = CopyOnWriteArrayList<SshConfig>()
 
     private val manualLines = listOf(
@@ -156,24 +148,24 @@ class TerminalView @JvmOverloads constructor(
         "• alias x=y: Map custom execution macros.",
         "• dnd: Toggle Android Do-Not-Disturb mode.",
         "• wifi: Open native Network panel.",
+        "• changelog: View system update history.",
         " ",
         "<bold>FILE SYSTEM & UTILS</bold>",
         "• ls, cd, pwd, mkdir, rm: Local file navigation.",
         "• note [text]: Append strings to local note buffer.",
         "• read: Display local note buffer.",
-        "• ping [ip]: Test ICMP packet latency."
+        "• ping [ip]: Test ICMP packet latency.",
+        " ",
+        "<bold>CHANGELOG v0.6.0</bold>",
+        "• SSH Engine: JSch integration with interactive auth.",
+        "• SSH UI: Add/Edit/Delete hosts, masked passwords.",
+        "• Terminal: ANSI escape code scrubbing.",
+        "• Visuals: True Gaussian bloom (aspect-ratio corrected).",
+        "• UX: Auto-launch apps via standard prompt."
     )
 
     private var scrollOffset = 0f
     private var forceScrollToBottom = true
-
-    // --- TOUCH ENGINE FIX ---
-    private var initialTouchX = 0f
-    private var initialTouchY = 0f
-    private var lastTouchY = 0f
-    private var isDragging = false
-    private val touchSlop = max(15f, ViewConfiguration.get(context).scaledTouchSlop.toFloat())
-    private val scrollSpeedMultiplier = 1.5f
 
     private var lastTabTapTime = 0L
     private var lastTabTapIndex = -1
@@ -197,13 +189,72 @@ class TerminalView @JvmOverloads constructor(
         }
     }
 
+    private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onDown(e: MotionEvent): Boolean {
+            return true
+        }
+
+        override fun onSingleTapUp(e: MotionEvent): Boolean {
+            performClick()
+            if (currentOverlay != OverlayState.NONE) {
+                handleOverlayTap(e.x, e.y)
+            } else if (currentState == AppState.SETTINGS) {
+                handleSettingsTap(e.x, e.y)
+            } else {
+                handleTap(e.x, e.y)
+            }
+            return true
+        }
+
+        override fun onDoubleTap(e: MotionEvent): Boolean {
+            if (currentState == AppState.TERMINAL && currentOverlay == OverlayState.NONE) {
+                for ((index, rect) in tabHitboxes) {
+                    if (rect.contains(e.x, e.y)) {
+                        val deadSession = sessions[index]
+                        if (deadSession.type == SessionType.SSH) deadSession.disconnectSsh()
+
+                        if (sessions.size > 1) {
+                            sessions.removeAt(index)
+                            activeTabIndex = min(activeTabIndex, sessions.size - 1)
+                        } else {
+                            sessions.clear()
+                            sessions.add(TerminalSession("Local", SessionType.LOCAL))
+                            activeTabIndex = 0
+                        }
+                        scrollToBottom()
+                        requestUpdate()
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+
+        override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
+            if (currentState == AppState.TERMINAL && currentOverlay == OverlayState.NONE) {
+                val fontMetrics = textPaint.fontMetrics
+                val textHeight = fontMetrics.descent - fontMetrics.ascent
+                val maxWidth = width - paddingLeft - paddingRight - 80f
+                val visibleArea = (height - paddingBottom - 40f) - (textHeight * 3) - 75f - (paddingTop + 80f)
+
+                val totalHeight = getTotalTextHeight(maxWidth)
+                val maxScroll = max(0f, totalHeight - visibleArea)
+
+                scrollOffset = (scrollOffset + distanceY).coerceIn(0f, maxScroll)
+                requestUpdate()
+            }
+            return true
+        }
+    })
+
     init {
         isFocusable = true
         isFocusableInTouchMode = true
 
         sessions.add(TerminalSession("Local", SessionType.LOCAL))
-        savedSshHosts.add(SshConfig("Pi-Hole", "root", "192.168.1.10", 22))
-        savedSshHosts.add(SshConfig("Web-Server", "admin", "104.22.45.1", 2222))
+
+        savedSshHosts.add(SshConfig("Pi-Hole", "root", "192.168.1.10", 22, ""))
+        savedSshHosts.add(SshConfig("Web-Server", "admin", "104.22.45.1", 2222, "admin123"))
 
         loadInstalledApps()
         applyTheme(TerminalTheme.LUMON)
@@ -212,6 +263,17 @@ class TerminalView @JvmOverloads constructor(
 
     override fun onCheckIsTextEditor(): Boolean = true
     override fun performClick(): Boolean = super.performClick()
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val handled = gestureDetector.onTouchEvent(event)
+        if (event.action == MotionEvent.ACTION_DOWN) {
+            if (currentState == AppState.TERMINAL) {
+                requestFocus()
+            }
+            return true
+        }
+        return handled || super.onTouchEvent(event)
+    }
 
     private fun applyTheme(theme: TerminalTheme) {
         currentTheme = theme
@@ -474,6 +536,7 @@ class TerminalView @JvmOverloads constructor(
         val newHitboxes = mutableMapOf<String, RectF>()
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
+        val touchPad = 25f
 
         val leftX = paddingLeft + 60f
         val rightX = width - paddingRight - 60f
@@ -484,6 +547,7 @@ class TerminalView @JvmOverloads constructor(
             OverlayState.FAVORITES -> max(1, favoriteApps.size)
             OverlayState.NEW_TAB_PROMPT -> 2
             OverlayState.SSH_HOSTS -> max(1, savedSshHosts.size) + 2
+            OverlayState.ADD_SSH_HOST -> 6
             else -> 1
         }
 
@@ -502,7 +566,8 @@ class TerminalView @JvmOverloads constructor(
             OverlayState.FAVORITES -> " FAVORITE APPS "
             OverlayState.NEW_TAB_PROMPT -> " ESTABLISH NEW CONNECTION "
             OverlayState.SSH_HOSTS -> " SECURE SHELL HOSTS "
-            OverlayState.MANUAL -> " USER MANUAL v0.5.0 "
+            OverlayState.ADD_SSH_HOST -> " CONFIGURE NEW HOST "
+            OverlayState.MANUAL -> " USER MANUAL v0.6.0 "
             else -> " OVERLAY "
         }
         canvas.drawText(title, leftX + 20f, currentY, boldTextPaint)
@@ -512,7 +577,6 @@ class TerminalView @JvmOverloads constructor(
         val closeX = rightX - closeWidth - 20f
         canvas.drawText(closeText, closeX, currentY, boldTextPaint)
 
-        val touchPad = 40f
         newHitboxes["close"] = RectF(closeX - touchPad, currentY - textHeight - touchPad, closeX + closeWidth + touchPad, currentY + fontMetrics.descent + touchPad)
 
         canvas.drawLine(leftX, currentY + fontMetrics.descent, rightX, currentY + fontMetrics.descent, textPaint)
@@ -548,8 +612,23 @@ class TerminalView @JvmOverloads constructor(
                 } else {
                     for ((index, host) in savedSshHosts.withIndex()) {
                         if (currentY > bottomY - (textHeight*3)) break
-                        canvas.drawText("  ${host.name} (${host.user}@${host.host})", leftX + 20f, currentY, textPaint)
-                        newHitboxes["connect_ssh_$index"] = RectF(leftX, currentY - textHeight, rightX, currentY + fontMetrics.descent)
+
+                        val hostText = "  ${host.name} (${host.user}@${host.host})"
+                        canvas.drawText(hostText, leftX + 20f, currentY, textPaint)
+
+                        val delBtn = "[X]"
+                        val editBtn = "[EDIT]"
+
+                        val delX = rightX - textPaint.measureText(delBtn) - 20f
+                        val editX = delX - textPaint.measureText(editBtn) - 20f
+
+                        canvas.drawText(delBtn, delX, currentY, boldTextPaint)
+                        canvas.drawText(editBtn, editX, currentY, boldTextPaint)
+
+                        newHitboxes["del_ssh_$index"] = RectF(delX - touchPad, currentY - textHeight - touchPad, delX + textPaint.measureText(delBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
+                        newHitboxes["edit_ssh_$index"] = RectF(editX - touchPad, currentY - textHeight - touchPad, editX + textPaint.measureText(editBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
+                        newHitboxes["connect_ssh_$index"] = RectF(leftX, currentY - textHeight, editX - 10f, currentY + fontMetrics.descent)
+
                         currentY += textHeight * 1.5f
                     }
                 }
@@ -558,6 +637,37 @@ class TerminalView @JvmOverloads constructor(
                 val addText = "  [+ ADD NEW HOST]"
                 canvas.drawText(addText, leftX + 20f, currentY, boldTextPaint)
                 newHitboxes["add_ssh"] = RectF(leftX, currentY - textHeight, rightX, currentY + fontMetrics.descent)
+            }
+            OverlayState.ADD_SSH_HOST -> {
+                for (i in sshFormLabels.indices) {
+                    val label = sshFormLabels[i]
+                    val isPasswordField = (i == 4)
+                    val isActiveField = (i == sshFormActiveField)
+
+                    val value = if (isPasswordField && !isActiveField && sshFormValues[i].isNotEmpty()) {
+                        "*".repeat(sshFormValues[i].length)
+                    } else {
+                        sshFormValues[i]
+                    }
+
+                    val cursorChar = if (isActiveField && (System.currentTimeMillis() / 300 % 2 == 0L)) "_" else ""
+                    val text = "  $label$value$cursorChar"
+
+                    val paintToUse = if (isActiveField) boldTextPaint else textPaint
+                    canvas.drawText(text, leftX + 20f, currentY, paintToUse)
+                    newHitboxes["ssh_field_$i"] = RectF(leftX, currentY - textHeight, rightX, currentY + fontMetrics.descent)
+                    currentY += textHeight * 1.5f
+                }
+
+                currentY += textHeight * 0.5f
+                val saveBtn = "  [ SAVE ]"
+                canvas.drawText(saveBtn, leftX + 20f, currentY, boldTextPaint)
+                newHitboxes["ssh_save"] = RectF(leftX, currentY - textHeight, leftX + 40f + textPaint.measureText(saveBtn), currentY + fontMetrics.descent)
+
+                val cancelBtn = "  [ CANCEL ]"
+                val cancelX = leftX + 60f + textPaint.measureText(saveBtn)
+                canvas.drawText(cancelBtn, cancelX, currentY, boldTextPaint)
+                newHitboxes["ssh_cancel"] = RectF(cancelX - 20f, currentY - textHeight, rightX, currentY + fontMetrics.descent)
             }
             OverlayState.MANUAL -> {
                 val manualMaxWidth = rightX - leftX - 40f
@@ -666,7 +776,7 @@ class TerminalView @JvmOverloads constructor(
         newSettings["add_alias"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(addBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
         currentY += textHeight * 3f
 
-        val repoText = "VERSION v0.5.0 :: [ GitHub: exolon/CRTUI ]"
+        val repoText = "VERSION v0.6.0 :: [ GitHub: exolon/CRTUI ]"
         canvas.drawText(repoText, startX, currentY, promptTextPaint)
         newSettings["github_link"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(repoText) + touchPad, currentY + fontMetrics.descent + touchPad)
         currentY += textHeight * 3f
@@ -683,7 +793,7 @@ class TerminalView @JvmOverloads constructor(
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
         var currentX = paddingLeft + 40f
-        val touchPad = 10f
+        val touchPad = 15f
 
         for ((index, session) in sessions.withIndex()) {
             val displayText = " ${session.name} "
@@ -719,7 +829,7 @@ class TerminalView @JvmOverloads constructor(
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
         var currentX = paddingLeft + 40f
-        val touchPad = 5f
+        val touchPad = 10f
 
         val keys = listOf("Tab", "CTRL+C", "<", ">", "^", "v", "/", "-", "=")
 
@@ -730,7 +840,7 @@ class TerminalView @JvmOverloads constructor(
 
             newKeys[key] = rect
             canvas.drawText(displayText, currentX, yPos, textPaint)
-            currentX += textWidth + 10f
+            currentX += textWidth + 15f
         }
         extraKeyHitboxes = newKeys
     }
@@ -740,7 +850,7 @@ class TerminalView @JvmOverloads constructor(
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
         var currentX = paddingLeft + 40f
-        val touchPad = 5f
+        val touchPad = 10f
 
         val session = activeSession()
         val itemsToDraw = when (currentCommandMode) {
@@ -772,9 +882,63 @@ class TerminalView @JvmOverloads constructor(
 
             newCmds[item] = rect
             canvas.drawText(displayText, currentX, commandBarY, textPaint)
-            currentX += textWidth + 20f
+            currentX += textWidth + 25f
         }
         commandHitboxes = newCmds
+    }
+
+    private fun handleTabCompletion() {
+        val session = activeSession()
+        val bufferLower = session.buffer.lowercase()
+
+        if (bufferLower.startsWith("fav -add ")) {
+            val query = bufferLower.substringAfter("fav -add ")
+            val match = installedApps.find { it.name.lowercase().startsWith(query) }
+            if (match != null) {
+                session.buffer = "fav -add ${match.name}"
+                session.cursor = session.buffer.length
+            }
+        } else if (bufferLower.startsWith("fav -rm ")) {
+            val query = bufferLower.substringAfter("fav -rm ")
+            val match = favoriteApps.find { it.lowercase().startsWith(query) }
+            if (match != null) {
+                session.buffer = "fav -rm $match"
+                session.cursor = session.buffer.length
+            }
+        } else if (!bufferLower.contains(" ") && bufferLower.isNotEmpty()) {
+            val matches = installedApps.filter { it.name.lowercase().startsWith(bufferLower) }
+            if (matches.size == 1) {
+                session.history.add(session.getPrompt() + session.buffer)
+                launchApp(matches[0].name)
+            } else if (matches.size > 1) {
+                session.history.add(session.getPrompt() + session.buffer)
+                session.history.add(matches.joinToString("  ") { "<bold>${it.name}</bold>" })
+
+                var prefix = matches[0].name
+                for (i in 1 until matches.size) {
+                    while (!matches[i].name.lowercase().startsWith(prefix.lowercase())) {
+                        prefix = prefix.substring(0, prefix.length - 1)
+                        if (prefix.isEmpty()) break
+                    }
+                }
+                if (prefix.length > session.buffer.length) {
+                    session.buffer = prefix
+                    session.cursor = session.buffer.length
+                }
+            } else {
+                val left = session.buffer.substring(0, session.cursor)
+                val right = session.buffer.substring(session.cursor)
+                session.buffer = left + "    " + right
+                session.cursor += 4
+            }
+        } else {
+            val left = session.buffer.substring(0, session.cursor)
+            val right = session.buffer.substring(session.cursor)
+            session.buffer = left + "    " + right
+            session.cursor += 4
+        }
+        scrollToBottom()
+        requestUpdate()
     }
 
     private fun launchApp(appName: String) {
@@ -782,8 +946,9 @@ class TerminalView @JvmOverloads constructor(
         if (app != null) {
             val intent = context.packageManager.getLaunchIntentForPackage(app.packageName)
             if (intent != null) {
-                context.startActivity(intent)
                 val session = activeSession()
+                session.history.add("> Launching $appName...")
+                context.startActivity(intent)
                 session.buffer = ""
                 session.cursor = 0
                 currentCommandMode = CommandMode.NORMAL
@@ -794,6 +959,16 @@ class TerminalView @JvmOverloads constructor(
     }
 
     private fun exportSettings() {
+        // Modern permission bypass vs Legacy Storage request
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R &&
+            context.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            (context as? android.app.Activity)?.requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), 112)
+            activeSession().history.add("> Requesting storage permission. Please accept and try again.")
+            scrollToBottom()
+            requestUpdate()
+            return
+        }
+
         try {
             val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             val exportFile = File(downloadsDir, "lumon_settings_export.txt")
@@ -817,63 +992,9 @@ class TerminalView @JvmOverloads constructor(
             activeSession().history.add("> Exported to Downloads/lumon_settings_export.txt")
             scrollToBottom()
         } catch (e: Exception) {
-            activeSession().history.add("> Export Failed. Missing permissions.")
+            activeSession().history.add("> Export Failed. Details: ${e.message}")
             scrollToBottom()
         }
-    }
-
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        when (event.action) {
-            MotionEvent.ACTION_DOWN -> {
-                initialTouchX = event.x
-                initialTouchY = event.y
-                lastTouchY = event.y
-                isDragging = false
-                return true
-            }
-            MotionEvent.ACTION_MOVE -> {
-                val dx = abs(event.x - initialTouchX)
-                val dy = abs(event.y - initialTouchY)
-
-                // Strictly separate drag threshold from the scroll tracker
-                if (dx > touchSlop || dy > touchSlop) {
-                    isDragging = true
-                }
-
-                if (isDragging && currentState == AppState.TERMINAL && currentOverlay == OverlayState.NONE) {
-                    val scrollDelta = lastTouchY - event.y
-                    val fontMetrics = textPaint.fontMetrics
-                    val textHeight = fontMetrics.descent - fontMetrics.ascent
-                    val maxWidth = width - paddingLeft - paddingRight - 80f
-                    val visibleArea = (height - paddingBottom - 40f) - (textHeight * 3) - 75f - (paddingTop + 80f)
-
-                    val totalHeight = getTotalTextHeight(maxWidth)
-                    val maxScroll = max(0f, totalHeight - visibleArea)
-
-                    scrollOffset = (scrollOffset + (scrollDelta * scrollSpeedMultiplier)).coerceIn(0f, maxScroll)
-                    lastTouchY = event.y
-                    requestUpdate()
-                }
-                return true
-            }
-            MotionEvent.ACTION_UP -> {
-                performClick()
-                val dx = abs(event.x - initialTouchX)
-                val dy = abs(event.y - initialTouchY)
-
-                if (!isDragging && dx <= touchSlop && dy <= touchSlop) {
-                    if (currentOverlay != OverlayState.NONE) {
-                        handleOverlayTap(event.x, event.y)
-                    } else if (currentState == AppState.SETTINGS) {
-                        handleSettingsTap(event.x, event.y)
-                    } else {
-                        handleTap(event.x, event.y)
-                    }
-                }
-                return true
-            }
-        }
-        return super.onTouchEvent(event)
     }
 
     private fun handleOverlayTap(touchX: Float, touchY: Float) {
@@ -903,17 +1024,71 @@ class TerminalView @JvmOverloads constructor(
                     OverlayState.SSH_HOSTS -> {
                         if (action == "close") currentOverlay = OverlayState.NONE
                         else if (action == "add_ssh") {
-                            activeSession().history.add("> SSH Configurator locked. Awaiting backend.")
-                            currentOverlay = OverlayState.NONE
+                            sshFormValues = MutableList(5) { "" }
+                            sshFormValues[3] = "22"
+                            sshFormActiveField = 0
+                            currentOverlay = OverlayState.ADD_SSH_HOST
+                            post {
+                                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                                imm.showSoftInput(this, 0)
+                            }
+                        }
+                        else if (action.startsWith("del_ssh_")) {
+                            val hostIndex = action.removePrefix("del_ssh_").toIntOrNull()
+                            if (hostIndex != null && hostIndex < savedSshHosts.size) {
+                                savedSshHosts.removeAt(hostIndex)
+                            }
+                        }
+                        else if (action.startsWith("edit_ssh_")) {
+                            val hostIndex = action.removePrefix("edit_ssh_").toIntOrNull()
+                            if (hostIndex != null && hostIndex < savedSshHosts.size) {
+                                val h = savedSshHosts[hostIndex]
+                                sshFormValues = mutableListOf(h.name, h.user, h.host, h.port.toString(), h.pass)
+                                sshFormActiveField = 0
+                                savedSshHosts.removeAt(hostIndex)
+                                currentOverlay = OverlayState.ADD_SSH_HOST
+                                post {
+                                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                                    imm.showSoftInput(this, 0)
+                                }
+                            }
                         }
                         else if (action.startsWith("connect_ssh_")) {
                             val hostIndex = action.removePrefix("connect_ssh_").toIntOrNull()
                             if (hostIndex != null && hostIndex < savedSshHosts.size) {
                                 val config = savedSshHosts[hostIndex]
-                                sessions.add(TerminalSession(config.name, SessionType.SSH, config))
+                                val newSession = TerminalSession(config.name, SessionType.SSH, config)
+                                sessions.add(newSession)
                                 activeTabIndex = sessions.size - 1
+
+                                newSession.connectSsh {
+                                    post {
+                                        scrollToBottom()
+                                        requestUpdate()
+                                    }
+                                }
                             }
                             currentOverlay = OverlayState.NONE
+                        }
+                    }
+                    OverlayState.ADD_SSH_HOST -> {
+                        if (action == "close" || action == "ssh_cancel") {
+                            currentOverlay = OverlayState.SSH_HOSTS
+                        } else if (action.startsWith("ssh_field_")) {
+                            sshFormActiveField = action.removePrefix("ssh_field_").toInt()
+                            post {
+                                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                                imm.showSoftInput(this, 0)
+                            }
+                        } else if (action == "ssh_save") {
+                            val name = sshFormValues[0].takeIf { it.isNotBlank() } ?: "Unnamed"
+                            val user = sshFormValues[1].takeIf { it.isNotBlank() } ?: "root"
+                            val host = sshFormValues[2].takeIf { it.isNotBlank() } ?: "127.0.0.1"
+                            val port = sshFormValues[3].toIntOrNull() ?: 22
+                            val pass = sshFormValues[4]
+
+                            savedSshHosts.add(SshConfig(name, user, host, port, pass))
+                            currentOverlay = OverlayState.SSH_HOSTS
                         }
                     }
                     OverlayState.MANUAL -> {
@@ -977,7 +1152,6 @@ class TerminalView @JvmOverloads constructor(
                     action == "github_link" -> {
                         val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/exolon/CRTUI"))
                         context.startActivity(intent)
-                        currentState = AppState.TERMINAL
                     }
                     action.startsWith("delete_alias_") -> {
                         val key = action.removePrefix("delete_alias_")
@@ -992,7 +1166,7 @@ class TerminalView @JvmOverloads constructor(
                         requestFocus()
                         post {
                             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                            imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+                            imm.showSoftInput(this, 0)
                         }
                     }
                     action == "exit" -> {
@@ -1030,29 +1204,7 @@ class TerminalView @JvmOverloads constructor(
         for ((key, rect) in extraKeyHitboxes) {
             if (rect.contains(touchX, touchY)) {
                 when (key) {
-                    "Tab" -> {
-                        val bufferLower = session.buffer.lowercase()
-                        if (bufferLower.startsWith("fav -add ")) {
-                            val query = bufferLower.substringAfter("fav -add ")
-                            val match = installedApps.find { it.name.lowercase().startsWith(query) }
-                            if (match != null) {
-                                session.buffer = "fav -add ${match.name}"
-                                session.cursor = session.buffer.length
-                            }
-                        } else if (bufferLower.startsWith("fav -rm ")) {
-                            val query = bufferLower.substringAfter("fav -rm ")
-                            val match = favoriteApps.find { it.lowercase().startsWith(query) }
-                            if (match != null) {
-                                session.buffer = "fav -rm $match"
-                                session.cursor = session.buffer.length
-                            }
-                        } else {
-                            val left = session.buffer.substring(0, session.cursor)
-                            val right = session.buffer.substring(session.cursor)
-                            session.buffer = left + "    " + right
-                            session.cursor += 4
-                        }
-                    }
+                    "Tab" -> handleTabCompletion()
                     "CTRL+C" -> {
                         session.history.add(session.getPrompt() + session.buffer + "^C")
                         session.buffer = ""
@@ -1088,23 +1240,7 @@ class TerminalView @JvmOverloads constructor(
         if (!actionTaken) {
             for ((index, rect) in tabHitboxes) {
                 if (rect.contains(touchX, touchY)) {
-                    val now = System.currentTimeMillis()
-
-                    if (index == lastTabTapIndex && (now - lastTabTapTime) < 300) {
-                        if (sessions.size > 1) {
-                            sessions.removeAt(index)
-                            activeTabIndex = min(activeTabIndex, sessions.size - 1)
-                        } else {
-                            sessions.clear()
-                            sessions.add(TerminalSession("Local", SessionType.LOCAL))
-                            activeTabIndex = 0
-                        }
-                    } else {
-                        activeTabIndex = index
-                    }
-
-                    lastTabTapTime = now
-                    lastTabTapIndex = index
+                    activeTabIndex = index
                     actionTaken = true
                     scrollToBottom()
                     break
@@ -1150,7 +1286,7 @@ class TerminalView @JvmOverloads constructor(
             requestFocus()
             post {
                 val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+                imm.showSoftInput(this, 0)
             }
         }
 
@@ -1164,22 +1300,41 @@ class TerminalView @JvmOverloads constructor(
 
         if (cmd != "alias" && aliases.containsKey(cmd)) {
             val mappedCmd = aliases[cmd]!!
-            session.history.add("> executing alias: $cmd -> $mappedCmd")
+            if (session.type == SessionType.LOCAL) {
+                session.history.add("> executing alias: $cmd -> $mappedCmd")
+            }
             processCommand(mappedCmd)
             return
         }
 
         if (session.type == SessionType.SSH) {
-            if (cmd == "clear" || cmd == "settings" || cmd == "alias") {
-                // Let UI handle it locally
+            if (cmd == "clear" || cmd == "settings" || cmd == "alias" || cmd == "exit") {
+                if (cmd == "exit") {
+                    session.disconnectSsh()
+                    session.history.add("> Terminated remote connection.")
+                }
             } else {
-                session.history.add("> SSH Execution disabled pending backend hook for: $input")
+                session.sendCommand(input) {
+                    post {
+                        scrollToBottom()
+                        requestUpdate()
+                    }
+                }
                 return
             }
         }
 
         when (cmd) {
             "clear" -> session.history.clear()
+
+            "changelog" -> {
+                session.history.add("> CHANGELOG v0.6.0")
+                session.history.add("• Added JSch SSH backend with TUI form.")
+                session.history.add("• Added ANSI scrubbing for clean NAS output.")
+                session.history.add("• Upgraded to true Gaussian bloom rendering.")
+                session.history.add("• Enabled instant app launch from CLI root.")
+                session.history.add("• Restored double-tap to close tabs.")
+            }
 
             "settings" -> {
                 currentState = AppState.SETTINGS
@@ -1368,7 +1523,18 @@ class TerminalView @JvmOverloads constructor(
                 }
             }
 
-            else -> session.history.add("Command not found: $cmd")
+            else -> {
+                val targetApp = input.trim().lowercase()
+                val appMatch = installedApps.find {
+                    it.name.lowercase() == targetApp || it.name.lowercase().contains(targetApp)
+                }
+
+                if (appMatch != null) {
+                    launchApp(appMatch.name)
+                } else {
+                    session.history.add("Command not found: $cmd")
+                }
+            }
         }
     }
 
@@ -1379,13 +1545,16 @@ class TerminalView @JvmOverloads constructor(
         return object : BaseInputConnection(this, true) {
             override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
                 if (text != null) {
-                    val session = activeSession()
-                    val left = session.buffer.substring(0, session.cursor)
-                    val right = session.buffer.substring(session.cursor)
-                    session.buffer = left + text + right
-                    session.cursor += text.length
-
-                    scrollToBottom()
+                    if (currentOverlay == OverlayState.ADD_SSH_HOST) {
+                        sshFormValues[sshFormActiveField] += text
+                    } else {
+                        val session = activeSession()
+                        val left = session.buffer.substring(0, session.cursor)
+                        val right = session.buffer.substring(session.cursor)
+                        session.buffer = left + text + right
+                        session.cursor += text.length
+                        scrollToBottom()
+                    }
                     requestUpdate()
                 }
                 return true
@@ -1393,46 +1562,64 @@ class TerminalView @JvmOverloads constructor(
 
             override fun sendKeyEvent(event: KeyEvent): Boolean {
                 if (event.action == KeyEvent.ACTION_DOWN) {
-                    val session = activeSession()
                     when (event.keyCode) {
+                        KeyEvent.KEYCODE_TAB -> {
+                            handleTabCompletion()
+                            return true
+                        }
                         KeyEvent.KEYCODE_DEL -> {
-                            if (session.cursor > 0) {
-                                val left = session.buffer.substring(0, session.cursor - 1)
-                                val right = session.buffer.substring(session.cursor)
-                                session.buffer = left + right
-                                session.cursor--
-
-                                if (session.buffer.isEmpty() && (currentCommandMode == CommandMode.APPS || currentCommandMode == CommandMode.ALIASES)) {
-                                    currentCommandMode = CommandMode.NORMAL
+                            if (currentOverlay == OverlayState.ADD_SSH_HOST) {
+                                val v = sshFormValues[sshFormActiveField]
+                                if (v.isNotEmpty()) {
+                                    sshFormValues[sshFormActiveField] = v.dropLast(1)
                                 }
-                                scrollToBottom()
-                                requestUpdate()
+                            } else {
+                                val session = activeSession()
+                                if (session.cursor > 0) {
+                                    val left = session.buffer.substring(0, session.cursor - 1)
+                                    val right = session.buffer.substring(session.cursor)
+                                    session.buffer = left + right
+                                    session.cursor--
+
+                                    if (session.buffer.isEmpty() && (currentCommandMode == CommandMode.APPS || currentCommandMode == CommandMode.ALIASES)) {
+                                        currentCommandMode = CommandMode.NORMAL
+                                    }
+                                    scrollToBottom()
+                                }
                             }
+                            requestUpdate()
                             return true
                         }
                         KeyEvent.KEYCODE_ENTER -> {
-                            if (session.buffer.isNotBlank()) {
-                                if (currentCommandMode == CommandMode.APPS) {
-                                    val filterText = session.buffer.lowercase()
-                                    val topApp = installedApps.find { it.name.lowercase().contains(filterText) }
-                                    if (topApp != null) launchApp(topApp.name)
-                                } else if (currentCommandMode == CommandMode.ALIASES) {
-                                    val filterText = session.buffer.lowercase()
-                                    val topAlias = aliases.keys.find { it.lowercase().contains(filterText) }
-                                    if (topAlias != null) {
-                                        session.history.add(session.getPrompt() + topAlias)
-                                        processCommand(aliases[topAlias]!!)
-                                        currentCommandMode = CommandMode.NORMAL
+                            if (currentOverlay == OverlayState.ADD_SSH_HOST) {
+                                sshFormActiveField = (sshFormActiveField + 1) % 5
+                            } else {
+                                val session = activeSession()
+                                if (session.buffer.isNotBlank()) {
+                                    if (currentCommandMode == CommandMode.APPS) {
+                                        val filterText = session.buffer.lowercase()
+                                        val topApp = installedApps.find { it.name.lowercase().contains(filterText) }
+                                        if (topApp != null) launchApp(topApp.name)
+                                    } else if (currentCommandMode == CommandMode.ALIASES) {
+                                        val filterText = session.buffer.lowercase()
+                                        val topAlias = aliases.keys.find { it.lowercase().contains(filterText) }
+                                        if (topAlias != null) {
+                                            session.history.add(session.getPrompt() + topAlias)
+                                            processCommand(aliases[topAlias]!!)
+                                            currentCommandMode = CommandMode.NORMAL
+                                        }
+                                    } else {
+                                        if (session.type == SessionType.LOCAL) {
+                                            session.history.add(session.getPrompt() + session.buffer)
+                                        }
+                                        processCommand(session.buffer)
                                     }
-                                } else {
-                                    session.history.add(session.getPrompt() + session.buffer)
-                                    processCommand(session.buffer)
+                                    session.buffer = ""
+                                    session.cursor = 0
+                                    scrollToBottom()
                                 }
-                                session.buffer = ""
-                                session.cursor = 0
-                                scrollToBottom()
-                                requestUpdate()
                             }
+                            requestUpdate()
                             return true
                         }
                     }

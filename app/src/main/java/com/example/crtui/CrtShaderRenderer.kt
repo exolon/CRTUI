@@ -34,32 +34,49 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
         uniform vec3 uTextColor; 
         uniform float uGlowIntensity;
         uniform int uEnableScanlines;
+        uniform vec2 uResolution;
 
         void main() {
             vec4 textCol = texture2D(uTexture, vTexCoord);
             
             float scanline = 0.0;
             if (uEnableScanlines == 1) {
-                scanline = sin(vTexCoord.y * 1200.0) * 0.03;
+                // Lock scanlines to physical pixel height for perfect horizontal lines
+                scanline = sin(vTexCoord.y * uResolution.y * 1.5) * 0.04;
             }
             vec3 baseColor = uBgColor - scanline;
 
-            float bloom = 0.0;
-            float offset = 0.003;
-            bloom += texture2D(uTexture, vTexCoord + vec2(offset, 0.0)).a;
-            bloom += texture2D(uTexture, vTexCoord + vec2(-offset, 0.0)).a;
-            bloom += texture2D(uTexture, vTexCoord + vec2(0.0, offset)).a;
-            bloom += texture2D(uTexture, vTexCoord + vec2(0.0, -offset)).a;
-            bloom += texture2D(uTexture, vTexCoord + vec2(offset, offset)).a;
-            bloom += texture2D(uTexture, vTexCoord + vec2(-offset, -offset)).a;
-            bloom += texture2D(uTexture, vTexCoord + vec2(offset, -offset)).a;
-            bloom += texture2D(uTexture, vTexCoord + vec2(-offset, offset)).a;
+            // True Gaussian Bloom using normalized physical pixel coordinates
+            vec2 pixel = 1.0 / uResolution;
+            float spread = 2.5; // Radius of the inner glow
+            vec2 offset1 = pixel * spread;
+            vec2 offset2 = pixel * (spread * 2.0); // Radius of the outer soft halo
 
+            float bloom = 0.0;
+            
+            // Inner Core (Heavy weights)
+            bloom += texture2D(uTexture, vTexCoord).a * 0.227027;
+            bloom += texture2D(uTexture, vTexCoord + vec2(offset1.x, 0.0)).a * 0.15;
+            bloom += texture2D(uTexture, vTexCoord + vec2(-offset1.x, 0.0)).a * 0.15;
+            bloom += texture2D(uTexture, vTexCoord + vec2(0.0, offset1.y)).a * 0.15;
+            bloom += texture2D(uTexture, vTexCoord + vec2(0.0, -offset1.y)).a * 0.15;
+            bloom += texture2D(uTexture, vTexCoord + vec2(offset1.x, offset1.y)).a * 0.07;
+            bloom += texture2D(uTexture, vTexCoord + vec2(-offset1.x, offset1.y)).a * 0.07;
+            bloom += texture2D(uTexture, vTexCoord + vec2(offset1.x, -offset1.y)).a * 0.07;
+            bloom += texture2D(uTexture, vTexCoord + vec2(-offset1.x, -offset1.y)).a * 0.07;
+            
+            // Outer Halo (Light weights)
+            bloom += texture2D(uTexture, vTexCoord + vec2(offset2.x, 0.0)).a * 0.03;
+            bloom += texture2D(uTexture, vTexCoord + vec2(-offset2.x, 0.0)).a * 0.03;
+            bloom += texture2D(uTexture, vTexCoord + vec2(0.0, offset2.y)).a * 0.03;
+            bloom += texture2D(uTexture, vTexCoord + vec2(0.0, -offset2.y)).a * 0.03;
+
+            // Combine text, background, and multiply the accumulated light
             vec3 finalColor = mix(baseColor, textCol.rgb, textCol.a);
-            finalColor += uTextColor * (bloom * 0.15 * uGlowIntensity);
+            finalColor += uTextColor * (bloom * 0.8 * uGlowIntensity);
             
             if (uEnableScanlines == 1) {
-                finalColor -= scanline;
+                finalColor -= scanline * 0.5; // Slightly soften scanlines over bright text
             }
             
             gl_FragColor = vec4(finalColor, 1.0);
@@ -74,6 +91,8 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
     private var textColorHandle = 0
     private var glowHandle = 0
     private var scanlinesHandle = 0
+    private var resolutionHandle = 0
+
     private val textureId = IntArray(1)
 
     private val vertexBuffer: FloatBuffer
@@ -91,6 +110,9 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
 
     private var terminalBitmap: Bitmap? = null
     private var internalCanvas: Canvas? = null
+
+    private var screenWidth = 0f
+    private var screenHeight = 0f
 
     init {
         vertexBuffer = ByteBuffer.allocateDirect(cubeCoords.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
@@ -116,6 +138,7 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
         textColorHandle = GLES20.glGetUniformLocation(programHandle, "uTextColor")
         glowHandle = GLES20.glGetUniformLocation(programHandle, "uGlowIntensity")
         scanlinesHandle = GLES20.glGetUniformLocation(programHandle, "uEnableScanlines")
+        resolutionHandle = GLES20.glGetUniformLocation(programHandle, "uResolution")
 
         GLES20.glGenTextures(1, textureId, 0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId[0])
@@ -125,6 +148,8 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES20.glViewport(0, 0, width, height)
+        screenWidth = width.toFloat()
+        screenHeight = height.toFloat()
         terminalBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         internalCanvas = Canvas(terminalBitmap!!)
         isDirty = true
@@ -158,6 +183,9 @@ class CrtShaderRenderer(private val terminalView: TerminalView) : GLSurfaceView.
         GLES20.glUniform3f(textColorHandle, currentTextColor[0], currentTextColor[1], currentTextColor[2])
         GLES20.glUniform1f(glowHandle, glowIntensity)
         GLES20.glUniform1i(scanlinesHandle, if (isScanlinesEnabled) 1 else 0)
+
+        // Pass the screen shape mathematically to the GPU
+        GLES20.glUniform2f(resolutionHandle, screenWidth, screenHeight)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId[0])

@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.crtui"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.5"
+        versionCode = 2
+        versionName = "0.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -45,6 +45,5 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     // SSH Engine
-    implementation("com.hierynomus:sshj:0.35.0")
-    implementation("org.slf4j:slf4j-simple:1.7.36")
+    implementation("com.github.mwiede:jsch:0.2.17")
 }
