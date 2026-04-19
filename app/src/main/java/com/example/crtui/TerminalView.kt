@@ -58,10 +58,12 @@ class TerminalView @JvmOverloads constructor(
     private var useCustomKeyboard = true
     private val keyboardEngine = KeyboardEngine { keyId -> handleCustomKey(keyId) }
 
-    // --- THEME ENGINE ---
-    enum class TerminalTheme { GREEN, LUMON, AMBER }
+    // --- THEME & FONT ENGINE ---
+    enum class TerminalTheme { GREEN, LUMON, AMBER, CPC464 }
+    enum class TerminalFont { GLASS_TTY, PIXELIFY }
 
     private var currentTheme = TerminalTheme.LUMON
+    private var currentFont = TerminalFont.GLASS_TTY
     private var currentTextColor = Color.parseColor("#00E5FF")
     private var currentTextSize = 37f
     private var currentGlowIntensity = 0.6f
@@ -70,20 +72,17 @@ class TerminalView @JvmOverloads constructor(
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = currentTextColor
         textSize = currentTextSize
-        typeface = ResourcesCompat.getFont(context, R.font.glass_tty)
     }
 
     private val boldTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = currentTextColor
         textSize = currentTextSize
-        typeface = ResourcesCompat.getFont(context, R.font.glass_tty)
         isFakeBoldText = true
     }
 
     private val promptTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = currentTextColor
         textSize = currentTextSize
-        typeface = ResourcesCompat.getFont(context, R.font.glass_tty)
         isFakeBoldText = true
     }
 
@@ -101,7 +100,6 @@ class TerminalView @JvmOverloads constructor(
     private val invertedTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#05101D")
         textSize = currentTextSize
-        typeface = ResourcesCompat.getFont(context, R.font.glass_tty)
     }
 
     private val clearPaint = Paint().apply {
@@ -146,6 +144,7 @@ class TerminalView @JvmOverloads constructor(
         "• Overlays: Tap [Favs] for Favorites, [*] for Settings.",
         "• Keys: Use [Tab] to autocomplete Apps and Favs.",
         "• Suggest: Swipe command bar to scroll results.",
+        "• Scroll: Drag terminal to view history.",
         " ",
         "<bold>CORE COMMANDS</bold>",
         "• s [query]: System-wide web search.",
@@ -159,21 +158,17 @@ class TerminalView @JvmOverloads constructor(
         "• ls, cd, pwd, mkdir, rm: Local file navigation.",
         "• note [text]: Append strings to local note buffer.",
         "• read: Display local note buffer.",
-        "• ping [ip]: Test ICMP packet latency.",
-        " ",
-        "<bold>CHANGELOG v0.7.0</bold>",
-        "• Execution: Smart app-launch (exact > start > contain).",
-        "• Navigation: Horizontally scrollable command bar.",
-        "• Atmosphere: Lumon Corporate BIOS boot sequence.",
-        "• Sub-Menus: Added dedicated Sys and Net command modes.",
-        "• Background: Notification-ID live replacement (no spam).",
-        "• Input: Zero-latency native TUI Keyboard implementation.",
-        "• Settings: Secure SSH Host export (passwords stripped)."
+        "• ping [ip]: Test ICMP packet latency."
     )
 
     private var scrollOffset = 0f
     private var forceScrollToBottom = true
     private var weatherString = "WTHR: SYNC..."
+
+    // --- CACHING ENGINE ---
+    private var lastHistorySize = -1
+    private var cachedTotalHeight = 0f
+    private val MAX_HISTORY_RENDER_LINES = 150 // Hard limit to prevent Garbage Collection choke
 
     // --- COMMAND BAR SCROLL ENGINE ---
     private var commandScrollOffset = 0f
@@ -181,18 +176,17 @@ class TerminalView @JvmOverloads constructor(
     private var lastCommandBarY = 0f
     private var commandBarStartX = 0f
 
-    // --- BOOT ENGINE ---
+    // --- BOOT & TOUCH ENGINES ---
     @Volatile private var isBooting = true
-
-    private var lastTabTapTime = 0L
-    private var lastTabTapIndex = -1
+    @Volatile private var isUiTouch = false
 
     private var crtSurfaceView: GLSurfaceView? = null
     private var shaderRenderer: CrtShaderRenderer? = null
 
     private val cursorPulseRunnable = object : Runnable {
         override fun run() {
-            if (currentState == AppState.TERMINAL) requestUpdate()
+            // Unlocked: Updates run continuously to prevent Settings/Overlay screens from freezing
+            requestUpdate()
             postDelayed(this, 32)
         }
     }
@@ -214,22 +208,8 @@ class TerminalView @JvmOverloads constructor(
 
         override fun onSingleTapUp(e: MotionEvent): Boolean {
             performClick()
-
-            if (useCustomKeyboard && (currentState == AppState.TERMINAL) && !isBooting) {
-                if (keyboardEngine.handleTouch(e.x, e.y)) {
-                    requestUpdate()
-                    return true
-                }
-            }
-
-            if (!isBooting) {
-                if (currentOverlay != OverlayState.NONE) {
-                    handleOverlayTap(e.x, e.y)
-                } else if (currentState == AppState.SETTINGS) {
-                    handleSettingsTap(e.x, e.y)
-                } else {
-                    handleTap(e.x, e.y)
-                }
+            if (!isBooting && currentState == AppState.TERMINAL && currentOverlay == OverlayState.NONE) {
+                handleTap(e.x, e.y)
             }
             return true
         }
@@ -267,17 +247,11 @@ class TerminalView @JvmOverloads constructor(
                 if (e1 != null && e1.y > lastCommandBarY - textHeight * 1.5f && e1.y < lastCommandBarY + textHeight * 1.5f && isHorizontalPan) {
                     val oldOffset = commandScrollOffset
                     commandScrollOffset = (commandScrollOffset + distanceX).coerceIn(0f, maxCommandScroll)
-                    if (oldOffset != commandScrollOffset) {
-                        requestUpdate()
-                    }
+                    if (oldOffset != commandScrollOffset) requestUpdate()
                     return true
                 } else {
-                    val maxWidth = width - paddingLeft - paddingRight - 80f
-                    val visibleArea = (height - paddingBottom - 40f) - (textHeight * 3) - 75f - (paddingTop + 80f)
-                    val totalHeight = getTotalTextHeight(maxWidth)
-                    val maxScroll = max(0f, totalHeight - visibleArea)
-
-                    scrollOffset = (scrollOffset + distanceY).coerceIn(0f, maxScroll)
+                    scrollOffset += distanceY
+                    forceScrollToBottom = false // Break the auto-scroll lock only when user actively pans
                     requestUpdate()
                     return true
                 }
@@ -297,10 +271,30 @@ class TerminalView @JvmOverloads constructor(
 
         loadInstalledApps()
         fetchWeather()
+        applyFont()
         applyTheme(TerminalTheme.LUMON)
 
         runBootSequence()
         post(cursorPulseRunnable)
+    }
+
+    private fun applyFont() {
+        val fontRes = if (currentFont == TerminalFont.GLASS_TTY) {
+            R.font.glass_tty
+        } else {
+            R.font.pixelifysans
+        }
+
+        try {
+            val tf = ResourcesCompat.getFont(context, fontRes)
+            textPaint.typeface = tf
+            boldTextPaint.typeface = tf
+            promptTextPaint.typeface = tf
+            invertedTextPaint.typeface = tf
+        } catch (e: Exception) {
+            // Fallback if font is missing
+        }
+        requestUpdate()
     }
 
     private fun runBootSequence() {
@@ -423,7 +417,9 @@ class TerminalView @JvmOverloads constructor(
     override fun performClick(): Boolean = super.performClick()
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // Zero-Latency Pipeline Firewall
         if (event.action == MotionEvent.ACTION_DOWN) {
+            isUiTouch = false
             if (isBooting) {
                 isBooting = false
                 return true
@@ -431,12 +427,36 @@ class TerminalView @JvmOverloads constructor(
             if (currentState == AppState.TERMINAL) {
                 requestFocus()
             }
-            if (useCustomKeyboard && currentState == AppState.TERMINAL && currentOverlay == OverlayState.NONE && !isBooting) {
+
+            // 1. Evaluate Keyboard (Bypasses gesture leakage)
+            if (useCustomKeyboard && currentState == AppState.TERMINAL && currentOverlay == OverlayState.NONE) {
                 if (keyboardEngine.handleTouch(event.x, event.y)) {
+                    isUiTouch = true
                     requestUpdate()
                     return true
                 }
             }
+
+            // 2. Evaluate Non-Scrollable Static Menus (Bypasses gesture leakage)
+            if (currentOverlay != OverlayState.NONE) {
+                if (handleOverlayTap(event.x, event.y)) {
+                    isUiTouch = true
+                    return true
+                }
+            } else if (currentState == AppState.SETTINGS) {
+                if (handleSettingsTap(event.x, event.y)) {
+                    isUiTouch = true
+                    return true
+                }
+            }
+        }
+
+        // Suppress gesture leakage if the tap was securely consumed in ACTION_DOWN
+        if (isUiTouch) {
+            if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
+                isUiTouch = false
+            }
+            return true
         }
 
         val handled = gestureDetector.onTouchEvent(event)
@@ -469,6 +489,13 @@ class TerminalView @JvmOverloads constructor(
                 bgColorArray = floatArrayOf(0.12f, 0.06f, 0.0f)
                 textColorArray = floatArrayOf(1.0f, 0.7f, 0.0f)
                 invertedTextPaint.color = Color.parseColor("#1F0F00")
+            }
+            TerminalTheme.CPC464 -> {
+                currentTextColor = Color.parseColor("#FFFF00")
+                promptTextPaint.color = Color.parseColor("#FFFF00")
+                bgColorArray = floatArrayOf(0.0f, 0.0f, 0.6f)
+                textColorArray = floatArrayOf(1.0f, 1.0f, 0.0f)
+                invertedTextPaint.color = Color.parseColor("#0000AA")
             }
         }
 
@@ -610,14 +637,19 @@ class TerminalView @JvmOverloads constructor(
     }
 
     private fun getTotalTextHeight(maxWidth: Float): Float {
-        var totalHeight = 0f
         val session = activeSession()
-        for (line in session.history) {
-            val maxL = if (line.startsWith("<bold>![")) 2 else Int.MAX_VALUE
-            totalHeight = drawAndMeasureWrappedText(null, line, 0f, totalHeight, maxWidth, maxLines = maxL).nextY
+        if (session.history.size != lastHistorySize) {
+            var h = 0f
+            // CAPPED RENDERING: Only parse the last 150 lines to prevent UI garbage-collection choke.
+            val historyToRender = session.history.takeLast(MAX_HISTORY_RENDER_LINES)
+            for (line in historyToRender) {
+                val maxL = if (line.startsWith("<bold>![")) 2 else Int.MAX_VALUE
+                h = drawAndMeasureWrappedText(null, line, 0f, h, maxWidth, maxLines = maxL).nextY
+            }
+            cachedTotalHeight = h
+            lastHistorySize = session.history.size
         }
-        totalHeight = drawAndMeasureWrappedText(null, "<prompt>${session.getPrompt()}</prompt>${session.buffer}", 0f, totalHeight, maxWidth).nextY
-        return totalHeight
+        return drawAndMeasureWrappedText(null, "<prompt>${session.getPrompt()}</prompt>${session.buffer}", 0f, cachedTotalHeight, maxWidth).nextY
     }
 
     override fun onDraw(canvas: Canvas) {}
@@ -648,7 +680,8 @@ class TerminalView @JvmOverloads constructor(
             }
         }
 
-        val textTopLimit = paddingTop + 80f
+        val headerY = paddingTop + max(40f, textHeight)
+        val textTopLimit = headerY + 20f
         val textBottomLimit = if (isBooting) height - paddingBottom - 20f else commandBarY - textHeight - 20f
 
         if (currentState == AppState.SETTINGS && !isBooting) {
@@ -669,7 +702,6 @@ class TerminalView @JvmOverloads constructor(
 
         if (forceScrollToBottom) {
             scrollOffset = maxScroll
-            forceScrollToBottom = false
         } else {
             scrollOffset = scrollOffset.coerceIn(0f, maxScroll)
         }
@@ -677,24 +709,47 @@ class TerminalView @JvmOverloads constructor(
         var currentY = textTopLimit - scrollOffset
 
         val timeStr = SimpleDateFormat("MMM dd, HH:mm", Locale.US).format(Date())
-        canvas.drawText(timeStr, startX, paddingTop + 60f, promptTextPaint)
-
-        val weatherWidth = promptTextPaint.measureText(weatherString)
-        val centerWeatherX = (width / 2f) - (weatherWidth / 2f)
-        canvas.drawText(weatherString, centerWeatherX, paddingTop + 60f, promptTextPaint)
-
         val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
         val batteryPct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
         val batStr = "PWR: $batteryPct%"
-        val batWidth = promptTextPaint.measureText(batStr)
-        canvas.drawText(batStr, width - paddingRight - 40f - batWidth, paddingTop + 60f, promptTextPaint)
+
+        val origSize = promptTextPaint.textSize
+        var hSize = origSize
+
+        var timeW = promptTextPaint.measureText(timeStr)
+        var weatherW = promptTextPaint.measureText(weatherString)
+        var batW = promptTextPaint.measureText(batStr)
+        val maxHeaderW = width - paddingLeft - paddingRight - 40f
+
+        while ((timeW + weatherW + batW + 40f) > maxHeaderW && hSize > 16f) {
+            hSize -= 1f
+            promptTextPaint.textSize = hSize
+            timeW = promptTextPaint.measureText(timeStr)
+            weatherW = promptTextPaint.measureText(weatherString)
+            batW = promptTextPaint.measureText(batStr)
+        }
+
+        canvas.drawText(timeStr, startX, headerY, promptTextPaint)
+        val centerWeatherX = (width / 2f) - (weatherW / 2f)
+        canvas.drawText(weatherString, centerWeatherX, headerY, promptTextPaint)
+        canvas.drawText(batStr, width - paddingRight - 40f - batW, headerY, promptTextPaint)
+
+        promptTextPaint.textSize = origSize
 
         canvas.save()
         canvas.clipRect(0f, textTopLimit, width.toFloat(), textBottomLimit + fontMetrics.descent)
 
-        for (line in session.history) {
+        // Render strictly the parsed visible buffer
+        val historyToRender = session.history.takeLast(MAX_HISTORY_RENDER_LINES)
+        for (line in historyToRender) {
             val maxL = if (line.startsWith("<bold>![")) 2 else Int.MAX_VALUE
-            currentY = drawAndMeasureWrappedText(canvas, line, startX, currentY, maxWidth, textBottomLimit, maxL).nextY
+            if (currentY > textBottomLimit + textHeight) break
+
+            val lineMetrics = drawAndMeasureWrappedText(null, line, startX, currentY, maxWidth, Float.MAX_VALUE, maxL)
+            if (lineMetrics.nextY >= textTopLimit) {
+                drawAndMeasureWrappedText(canvas, line, startX, currentY, maxWidth, textBottomLimit, maxL)
+            }
+            currentY = lineMetrics.nextY
         }
 
         if (!isBooting) {
@@ -759,7 +814,7 @@ class TerminalView @JvmOverloads constructor(
             OverlayState.NEW_TAB_PROMPT -> " ESTABLISH NEW CONNECTION "
             OverlayState.SSH_HOSTS -> " SECURE SHELL HOSTS "
             OverlayState.ADD_SSH_HOST -> " CONFIGURE NEW HOST "
-            OverlayState.MANUAL -> " USER MANUAL v0.7.0 "
+            OverlayState.MANUAL -> " USER MANUAL v0.7.2 "
             else -> " OVERLAY "
         }
         canvas.drawText(title, leftX + 20f, currentY, boldTextPaint)
@@ -884,7 +939,7 @@ class TerminalView @JvmOverloads constructor(
         var currentY = paddingTop + 100f
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
-        val touchPad = 25f
+        val touchPad = 40f // Expanded to prevent false-misses
 
         canvas.drawText("MACRODATA REFINEMENT :: PREFERENCES", startX, currentY, boldTextPaint)
         currentY += textHeight * 2f
@@ -895,6 +950,14 @@ class TerminalView @JvmOverloads constructor(
         val cycleX = startX + textPaint.measureText(themeLabel)
         canvas.drawText(cycleBtn, cycleX, currentY, boldTextPaint)
         newSettings["theme_cycle"] = RectF(cycleX - touchPad, currentY - textHeight - touchPad, cycleX + textPaint.measureText(cycleBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
+        currentY += textHeight * 1.5f
+
+        val fontTypeLabel = "Typeface: [${currentFont.name}]  "
+        canvas.drawText(fontTypeLabel, startX, currentY, textPaint)
+        val cycleFontBtn = "[ CYCLE ]"
+        val cycleFontX = startX + textPaint.measureText(fontTypeLabel)
+        canvas.drawText(cycleFontBtn, cycleFontX, currentY, boldTextPaint)
+        newSettings["font_cycle"] = RectF(cycleFontX - touchPad, currentY - textHeight - touchPad, cycleFontX + textPaint.measureText(cycleFontBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
         currentY += textHeight * 1.5f
 
         val kbdLabel = "Keyboard: "
@@ -976,7 +1039,7 @@ class TerminalView @JvmOverloads constructor(
         newSettings["add_alias"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(addBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
         currentY += textHeight * 3f
 
-        val repoText = "VERSION v0.7.0 :: [ GitHub: exolon/CRTUI ]"
+        val repoText = "VERSION v0.7.2 :: [ GitHub: exolon/CRTUI ]"
         canvas.drawText(repoText, startX, currentY, promptTextPaint)
         newSettings["github_link"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(repoText) + touchPad, currentY + fontMetrics.descent + touchPad)
         currentY += textHeight * 3f
@@ -1116,8 +1179,6 @@ class TerminalView @JvmOverloads constructor(
         commandHitboxes = newCmds
     }
 
-    // --- PIPELINE HANDLERS ---
-
     private fun injectChar(text: String) {
         if (currentOverlay == OverlayState.ADD_SSH_HOST) {
             sshFormValues[sshFormActiveField] += text
@@ -1194,7 +1255,7 @@ class TerminalView @JvmOverloads constructor(
                     val topAlias = aliases.keys.find { it.lowercase().contains(filterText) }
                     if (topAlias != null) {
                         session.history.add(session.getPrompt() + topAlias)
-                        processCommand(aliases[topAlias]!!)
+                        CommandEngine.process(context, session, aliases[topAlias]!!, installedApps, aliases, favoriteApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate) { post(it) }
                         currentCommandMode = CommandMode.NORMAL
                     }
                     session.buffer = ""
@@ -1203,7 +1264,7 @@ class TerminalView @JvmOverloads constructor(
                     if (session.type == SessionType.LOCAL) {
                         session.history.add(session.getPrompt() + session.buffer)
                     }
-                    val shouldClear = processCommand(session.buffer)
+                    val shouldClear = CommandEngine.process(context, session, session.buffer, installedApps, aliases, favoriteApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate) { post(it) }
                     if (shouldClear) {
                         session.buffer = ""
                         session.cursor = 0
@@ -1230,8 +1291,14 @@ class TerminalView @JvmOverloads constructor(
             }
             "<" -> session.cursor = max(0, session.cursor - 1)
             ">" -> session.cursor = min(session.buffer.length, session.cursor + 1)
-            "^" -> scrollOffset += 200f
-            "v" -> scrollOffset = (scrollOffset - 200f).coerceAtLeast(0f)
+            "^" -> {
+                scrollOffset += 200f
+                forceScrollToBottom = false
+            }
+            "v" -> {
+                scrollOffset = (scrollOffset - 200f).coerceAtLeast(0f)
+                forceScrollToBottom = false
+            }
             else -> injectChar(keyId)
         }
         requestUpdate()
@@ -1319,6 +1386,7 @@ class TerminalView @JvmOverloads constructor(
             val data = StringBuilder()
             data.appendLine("LUMON MACRODATA EXPORT")
             data.appendLine("Theme: ${currentTheme.name}")
+            data.appendLine("Font: ${currentFont.name}")
             data.appendLine("FontSize: $currentTextSize")
             data.appendLine("GlowIntensity: $currentGlowIntensity")
             data.appendLine("Scanlines: $isScanlinesEnabled")
@@ -1345,8 +1413,7 @@ class TerminalView @JvmOverloads constructor(
         }
     }
 
-    private fun handleOverlayTap(touchX: Float, touchY: Float) {
-        var windowActionTaken = false
+    private fun handleOverlayTap(touchX: Float, touchY: Float): Boolean {
         for ((action, rect) in overlayHitboxes) {
             if (rect.contains(touchX, touchY)) {
                 when (currentOverlay) {
@@ -1450,23 +1517,25 @@ class TerminalView @JvmOverloads constructor(
                     }
                     else -> {}
                 }
-                windowActionTaken = true
-                break
+                scrollToBottom()
+                requestUpdate()
+                return true
             }
         }
-        if (windowActionTaken) {
-            scrollToBottom()
-            requestUpdate()
-        }
+        return false
     }
 
-    private fun handleSettingsTap(touchX: Float, touchY: Float) {
+    private fun handleSettingsTap(touchX: Float, touchY: Float): Boolean {
         for ((action, rect) in settingsHitboxes) {
             if (rect.contains(touchX, touchY)) {
                 when {
                     action == "theme_cycle" -> {
                         val nextTheme = TerminalTheme.values()[(currentTheme.ordinal + 1) % TerminalTheme.values().size]
                         applyTheme(nextTheme)
+                    }
+                    action == "font_cycle" -> {
+                        currentFont = if (currentFont == TerminalFont.GLASS_TTY) TerminalFont.PIXELIFY else TerminalFont.GLASS_TTY
+                        applyFont()
                     }
                     action == "toggle_keyboard" -> {
                         useCustomKeyboard = !useCustomKeyboard
@@ -1535,14 +1604,13 @@ class TerminalView @JvmOverloads constructor(
                     }
                 }
                 requestUpdate()
-                break
+                return true
             }
         }
+        return false
     }
 
     private fun handleTap(touchX: Float, touchY: Float) {
-        var actionTaken = false
-
         if (settingsTabHitbox?.contains(touchX, touchY) == true) {
             currentState = AppState.SETTINGS
             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
@@ -1565,371 +1633,89 @@ class TerminalView @JvmOverloads constructor(
             for ((key, rect) in extraKeyHitboxes) {
                 if (rect.contains(touchX, touchY)) {
                     handleCustomKey(key)
-                    actionTaken = true
-                    break
+                    return
                 }
             }
         }
 
-        if (!actionTaken) {
-            for ((index, rect) in tabHitboxes) {
-                if (rect.contains(touchX, touchY)) {
-                    activeTabIndex = index
-                    actionTaken = true
-                    scrollToBottom()
-                    break
-                }
+        for ((index, rect) in tabHitboxes) {
+            if (rect.contains(touchX, touchY)) {
+                activeTabIndex = index
+                scrollToBottom()
+                requestUpdate()
+                return
             }
         }
 
-        if (!actionTaken) {
-            for ((commandString, rect) in commandHitboxes) {
-                if (rect.contains(touchX, touchY)) {
-                    when {
-                        currentCommandMode == CommandMode.NORMAL && commandString == "Apps" -> {
-                            currentCommandMode = CommandMode.APPS
-                            commandScrollOffset = 0f
-                        }
-                        currentCommandMode == CommandMode.NORMAL && commandString == "Alias" -> {
-                            currentCommandMode = CommandMode.ALIASES
-                            commandScrollOffset = 0f
-                        }
-                        currentCommandMode == CommandMode.NORMAL && commandString == "Sys" -> {
-                            currentCommandMode = CommandMode.SYS
-                        }
-                        currentCommandMode == CommandMode.NORMAL && commandString == "Net" -> {
-                            currentCommandMode = CommandMode.NET
-                        }
-                        currentCommandMode == CommandMode.NORMAL && commandString == "Favs" -> {
-                            currentOverlay = OverlayState.FAVORITES
-                            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                            imm.hideSoftInputFromWindow(windowToken, 0)
-                        }
-                        currentCommandMode == CommandMode.APPS -> {
-                            launchApp(commandString)
-                            session.buffer = ""
-                            session.cursor = 0
-                            currentCommandMode = CommandMode.NORMAL
-                        }
-                        currentCommandMode == CommandMode.ALIASES -> {
-                            val mappedCmd = aliases[commandString]
-                            if (mappedCmd != null) {
-                                session.history.add(session.getPrompt() + commandString)
-                                processCommand(mappedCmd)
-                            }
-                            session.buffer = ""
-                            session.cursor = 0
-                            currentCommandMode = CommandMode.NORMAL
-                        }
-                        currentCommandMode == CommandMode.SYS -> {
-                            val cmd = commandString.lowercase()
-                            session.history.add(session.getPrompt() + cmd)
-                            processCommand(cmd)
-                            session.buffer = ""
-                            session.cursor = 0
-                            currentCommandMode = CommandMode.NORMAL
-                        }
-                        currentCommandMode == CommandMode.NET -> {
-                            val cmd = if (commandString == "PING") "ping 8.8.8.8" else commandString.lowercase()
-                            session.history.add(session.getPrompt() + cmd)
-                            processCommand(cmd)
-                            session.buffer = ""
-                            session.cursor = 0
-                            currentCommandMode = CommandMode.NORMAL
-                        }
+        for ((commandString, rect) in commandHitboxes) {
+            if (rect.contains(touchX, touchY)) {
+                when {
+                    currentCommandMode == CommandMode.NORMAL && commandString == "Apps" -> {
+                        currentCommandMode = CommandMode.APPS
+                        commandScrollOffset = 0f
                     }
-                    actionTaken = true
-                    break
-                }
-            }
-        }
-
-        if (!actionTaken) {
-            currentCommandMode = CommandMode.NORMAL
-            requestFocus()
-            if (!useCustomKeyboard) {
-                post {
-                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                    imm.showSoftInput(this, 0)
-                }
-            }
-        }
-
-        requestUpdate()
-    }
-
-    private fun processCommand(input: String): Boolean {
-        val session = activeSession()
-        val args = input.trim().split("\\s+".toRegex())
-        val cmd = args[0].lowercase()
-
-        if (cmd != "alias" && aliases.containsKey(cmd)) {
-            val mappedCmd = aliases[cmd]!!
-            if (session.type == SessionType.LOCAL) {
-                session.history.add("> executing alias: $cmd -> $mappedCmd")
-            }
-            processCommand(mappedCmd)
-            return true
-        }
-
-        if (session.type == SessionType.SSH) {
-            if (cmd == "clear" || cmd == "settings" || cmd == "alias" || cmd == "exit" || cmd == "changelog") {
-                if (cmd == "exit") {
-                    session.disconnectSsh()
-                    session.history.add("> Terminated remote connection.")
-                }
-            } else {
-                session.sendCommand(input) {
-                    post {
-                        scrollToBottom()
-                        requestUpdate()
+                    currentCommandMode == CommandMode.NORMAL && commandString == "Alias" -> {
+                        currentCommandMode = CommandMode.ALIASES
+                        commandScrollOffset = 0f
+                    }
+                    currentCommandMode == CommandMode.NORMAL && commandString == "Sys" -> {
+                        currentCommandMode = CommandMode.SYS
+                    }
+                    currentCommandMode == CommandMode.NORMAL && commandString == "Net" -> {
+                        currentCommandMode = CommandMode.NET
+                    }
+                    currentCommandMode == CommandMode.NORMAL && commandString == "Favs" -> {
+                        currentOverlay = OverlayState.FAVORITES
+                        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                        imm.hideSoftInputFromWindow(windowToken, 0)
+                    }
+                    currentCommandMode == CommandMode.APPS -> {
+                        launchApp(commandString)
+                        session.buffer = ""
+                        session.cursor = 0
+                        currentCommandMode = CommandMode.NORMAL
+                    }
+                    currentCommandMode == CommandMode.ALIASES -> {
+                        val mappedCmd = aliases[commandString]
+                        if (mappedCmd != null) {
+                            session.history.add(session.getPrompt() + commandString)
+                            CommandEngine.process(context, session, mappedCmd, installedApps, aliases, favoriteApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate) { post(it) }
+                        }
+                        session.buffer = ""
+                        session.cursor = 0
+                        currentCommandMode = CommandMode.NORMAL
+                    }
+                    currentCommandMode == CommandMode.SYS -> {
+                        val cmd = commandString.lowercase()
+                        session.history.add(session.getPrompt() + cmd)
+                        CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate) { post(it) }
+                        session.buffer = ""
+                        session.cursor = 0
+                        currentCommandMode = CommandMode.NORMAL
+                    }
+                    currentCommandMode == CommandMode.NET -> {
+                        val cmd = if (commandString == "PING") "ping 8.8.8.8" else commandString.lowercase()
+                        session.history.add(session.getPrompt() + cmd)
+                        CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate) { post(it) }
+                        session.buffer = ""
+                        session.cursor = 0
+                        currentCommandMode = CommandMode.NORMAL
                     }
                 }
+                requestUpdate()
+                return
             }
-            return true
         }
 
-        when (cmd) {
-            "clear" -> session.clearHistory()
-
-            "changelog" -> {
-                session.history.add("> CHANGELOG v0.7.0")
-                session.history.add("• Execution: Smart app-launch (exact > start > contain).")
-                session.history.add("• Navigation: Horizontally scrollable command bar.")
-                session.history.add("• Atmosphere: Lumon Corporate BIOS boot sequence.")
-                session.history.add("• Sub-Menus: Added dedicated Sys and Net command modes.")
-                session.history.add("• Background: Notification-ID live replacement (no spam).")
-                session.history.add("• Input: Zero-latency native TUI Keyboard implementation.")
-                session.history.add("• Settings: Secure SSH Host export (passwords stripped).")
-            }
-
-            "settings" -> {
-                currentState = AppState.SETTINGS
+        currentCommandMode = CommandMode.NORMAL
+        requestFocus()
+        if (!useCustomKeyboard) {
+            post {
                 val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                imm.hideSoftInputFromWindow(windowToken, 0)
-            }
-
-            "s" -> {
-                val query = input.substringAfter("s ").trim()
-                if (query.isNotEmpty()) {
-                    val intent = Intent(Intent.ACTION_WEB_SEARCH).apply { putExtra(SearchManager.QUERY, query) }
-                    try {
-                        context.startActivity(intent)
-                        session.history.add("> Searching: $query")
-                    } catch (e: Exception) {
-                        val uri = Uri.parse("https://www.google.com/search?q=${Uri.encode(query)}")
-                        context.startActivity(Intent(Intent.ACTION_VIEW, uri))
-                        session.history.add("> Searching (Browser fallback): $query")
-                    }
-                } else {
-                    session.history.add("Syntax error. Use: s [query]")
-                }
-            }
-
-            "mem" -> {
-                try {
-                    val actManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                    val memInfo = ActivityManager.MemoryInfo()
-                    actManager.getMemoryInfo(memInfo)
-                    val availMegs = memInfo.availMem / 1048576L
-                    val totalMegs = memInfo.totalMem / 1048576L
-                    session.history.add("RAM: $availMegs MB / $totalMegs MB free")
-
-                    val stat = StatFs(Environment.getExternalStorageDirectory().path)
-                    val bytesAvailable = stat.blockSizeLong * stat.availableBlocksLong
-                    val totalBytes = stat.blockSizeLong * stat.blockCountLong
-                    session.history.add("STO: ${bytesAvailable / 1048576L} MB / ${totalBytes / 1048576L} MB free")
-                } catch (e: Exception) {
-                    session.history.add("> Error reading system memory")
-                }
-            }
-
-            "bat" -> {
-                val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-                val batteryStatus = context.registerReceiver(null, intentFilter)
-                val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-                val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-                val batteryPct = level * 100 / scale.toFloat()
-                val temp = (batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10f
-                val volt = batteryStatus?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0
-                session.history.add("BATTERY: ${batteryPct.toInt()}% | ${temp}°C | ${volt}mV")
-            }
-
-            "vol" -> context.startActivity(Intent(Settings.ACTION_SOUND_SETTINGS))
-            "brt" -> context.startActivity(Intent(Settings.ACTION_DISPLAY_SETTINGS))
-            "bt" -> context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
-
-            "ip" -> {
-                Thread {
-                    try {
-                        val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
-                        var localIp = "Unknown"
-                        for (intf in interfaces) {
-                            for (addr in intf.inetAddresses) {
-                                if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                                    localIp = addr.hostAddress ?: "Unknown"
-                                }
-                            }
-                        }
-                        post {
-                            session.history.add("Local IP: $localIp")
-                            scrollToBottom()
-                            requestUpdate()
-                        }
-
-                        val pubIpUrl = java.net.URL("https://api.ipify.org")
-                        val pubIp = pubIpUrl.readText()
-                        post {
-                            session.history.add("Public IP: $pubIp")
-                            scrollToBottom()
-                            requestUpdate()
-                        }
-                    } catch (e: Exception) {
-                        post {
-                            session.history.add("> IP fetch failed.")
-                            requestUpdate()
-                        }
-                    }
-                }.start()
-            }
-
-            "pwd" -> session.history.add(session.cwd.absolutePath)
-
-            "ls" -> {
-                val files = session.cwd.listFiles()
-                if (files != null && files.isNotEmpty()) {
-                    val output = files.joinToString("  ") { if (it.isDirectory) "<bold>${it.name}/</bold>" else it.name }
-                    session.history.add(output)
-                } else {
-                    session.history.add(" (empty)")
-                }
-            }
-
-            "cd" -> {
-                if (args.size < 2) {
-                    session.cwd = Environment.getExternalStorageDirectory()
-                } else {
-                    val target = args[1]
-                    val newDir = if (target == "..") {
-                        session.cwd.parentFile ?: session.cwd
-                    } else if (target.startsWith("/")) {
-                        File(target)
-                    } else {
-                        File(session.cwd, target)
-                    }
-
-                    if (newDir.exists() && newDir.isDirectory) {
-                        session.cwd = newDir
-                    } else {
-                        session.history.add("cd: $target: No such file or directory")
-                    }
-                }
-            }
-
-            "mkdir" -> {
-                if (args.size > 1) {
-                    val newDir = File(session.cwd, args[1])
-                    if (newDir.mkdirs()) session.history.add("Created directory: ${args[1]}")
-                    else session.history.add("mkdir: cannot create directory '${args[1]}'")
-                }
-            }
-
-            "rm" -> {
-                if (args.size > 1) {
-                    val target = File(session.cwd, args[1])
-                    if (target.exists()) {
-                        val success = if (target.isDirectory) target.deleteRecursively() else target.delete()
-                        if (success) session.history.add("Removed: ${args[1]}")
-                        else session.history.add("rm: cannot remove '${args[1]}'")
-                    } else {
-                        session.history.add("rm: ${args[1]}: No such file or directory")
-                    }
-                }
-            }
-
-            "note" -> {
-                if (args.size > 1) {
-                    val noteText = input.substringAfter("note ").trim()
-                    val file = File(context.filesDir, "lumon_notes.txt")
-                    val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
-                    file.appendText("[$timestamp] $noteText\n")
-                    session.history.add("Saved to local buffer.")
-                }
-            }
-
-            "read" -> {
-                val file = File(context.filesDir, "lumon_notes.txt")
-                if (file.exists()) {
-                    session.history.addAll(file.readLines())
-                } else {
-                    session.history.add("Local buffer is empty.")
-                }
-            }
-
-            "dnd" -> {
-                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                if (nm.isNotificationPolicyAccessGranted) {
-                    val isDndOn = nm.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL
-                    val newFilter = if (isDndOn) NotificationManager.INTERRUPTION_FILTER_ALL else NotificationManager.INTERRUPTION_FILTER_NONE
-                    nm.setInterruptionFilter(newFilter)
-                    session.history.add("DND Mode: ${if (!isDndOn) "ENGAGED" else "DISABLED"}")
-                } else {
-                    session.history.add("Permission denied. Grant DND access in OS settings.")
-                }
-            }
-
-            "wifi" -> {
-                session.history.add("Opening OS Network Panel...")
-                context.startActivity(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY))
-            }
-
-            "ping" -> {
-                val ip = if (args.size > 1) args[1] else "8.8.8.8"
-                session.history.add("Pinging $ip...")
-                Thread {
-                    try {
-                        val process = Runtime.getRuntime().exec("ping -c 4 $ip")
-                        val reader = BufferedReader(InputStreamReader(process.inputStream))
-                        reader.forEachLine { line ->
-                            post {
-                                session.history.add(line)
-                                scrollToBottom()
-                                requestUpdate()
-                            }
-                        }
-                    } catch (e: Exception) {
-                        post {
-                            session.history.add("Ping failed: ${e.message}")
-                            requestUpdate()
-                        }
-                    }
-                }.start()
-            }
-
-            else -> {
-                val targetApp = input.trim().lowercase()
-                var matches = installedApps.filter { it.name.lowercase() == targetApp }
-
-                if (matches.isEmpty()) {
-                    matches = installedApps.filter { it.name.lowercase().startsWith(targetApp) }
-                }
-                if (matches.isEmpty()) {
-                    matches = installedApps.filter { it.name.lowercase().contains(targetApp) }
-                }
-
-                if (matches.size == 1) {
-                    launchApp(matches[0].name)
-                    return true
-                } else if (matches.size > 1) {
-                    session.history.add(matches.joinToString("  ") { "<bold>${it.name}</bold>" })
-                    return false
-                } else {
-                    session.history.add("Command not found: $cmd")
-                    return true
-                }
+                imm.showSoftInput(this, 0)
             }
         }
-        return true
+        requestUpdate()
     }
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
