@@ -5,11 +5,11 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
 import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
 import android.net.Uri
@@ -17,6 +17,7 @@ import android.opengl.GLSurfaceView
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
+import android.provider.Settings
 import android.text.InputType
 import android.util.AttributeSet
 import android.view.GestureDetector
@@ -68,6 +69,7 @@ class TerminalView @JvmOverloads constructor(
     private var currentTextColor = Color.parseColor("#00E5FF")
     private var currentTextSize = 37f
     private var currentGlowIntensity = 0.6f
+    private var currentBgOpacity = 0.2f
     private var isScanlinesEnabled = true
 
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -117,7 +119,7 @@ class TerminalView @JvmOverloads constructor(
     private enum class CommandMode { NORMAL, APPS, ALIASES, SYS, NET }
     private var currentCommandMode = CommandMode.NORMAL
 
-    private enum class OverlayState { NONE, FAVORITES, NEW_TAB_PROMPT, SSH_HOSTS, MANUAL, ADD_SSH_HOST, NOTIFICATIONS }
+    private enum class OverlayState { NONE, FAVORITES, NEW_TAB_PROMPT, SSH_HOSTS, MANUAL, ADD_SSH_HOST, NOTIFICATIONS, DOCK_CONFIG }
     @Volatile private var currentOverlay = OverlayState.NONE
 
     private val sshFormLabels = listOf("Name: ", "User: ", "Host/IP: ", "Port: ", "Pass: ")
@@ -131,6 +133,7 @@ class TerminalView @JvmOverloads constructor(
     @Volatile private var extraKeyHitboxes: Map<String, RectF> = emptyMap()
     @Volatile private var settingsHitboxes: Map<String, RectF> = emptyMap()
     @Volatile private var overlayHitboxes: Map<String, RectF> = emptyMap()
+    @Volatile private var dockHitboxes: Map<String, RectF> = emptyMap()
 
     data class AppInfo(val name: String, val packageName: String)
     private val installedApps = mutableListOf<AppInfo>()
@@ -138,8 +141,10 @@ class TerminalView @JvmOverloads constructor(
     private val favoriteApps = CopyOnWriteArrayList<String>()
     private val aliases = ConcurrentHashMap<String, String>()
 
-    // --- FIREWALL ENGINE ---
+    // --- FIREWALL & DOCK ENGINES ---
     private val allowedNotifApps = ConcurrentHashMap.newKeySet<String>()
+    private val dockApps = CopyOnWriteArrayList<String>()
+    private var showIconDock = true
 
     private val savedSshHosts = CopyOnWriteArrayList<SshConfig>()
 
@@ -147,13 +152,12 @@ class TerminalView @JvmOverloads constructor(
         "<bold>INTERFACE & NAVIGATION</bold>",
         "• Tabs: Double-tap to close. Tap [+] for new session.",
         "• Overlays: Tap [Favs] for Favorites, [*] for Settings.",
-        "• Keys: Use [Tab] to autocomplete Apps and Favs.",
         "• Suggest: Swipe command bar to scroll results.",
         "• Scroll: Drag terminal to view history.",
         " ",
         "<bold>CORE COMMANDS</bold>",
         "• s [query]: System-wide web search.",
-        "• fav -add/rm: Manage the Favorite Apps overlay.",
+        "• dock -add/rm: Add app shortcuts to main icon dock.",
         "• notif -add/rm: Add app to Notification Firewall whitelist.",
         "• alias x=y: Map custom execution macros.",
         "• dnd: Toggle Android Do-Not-Disturb mode.",
@@ -164,15 +168,7 @@ class TerminalView @JvmOverloads constructor(
         "• ls, cd, pwd, mkdir, rm: Local file navigation.",
         "• note [text]: Append strings to local note buffer.",
         "• read: Display local note buffer.",
-        "• ping [ip]: Test ICMP packet latency.",
-        " ",
-        "<bold>CHANGELOG v0.8.0</bold>",
-        "• Security: Added robust Notification Firewall engine.",
-        "• Overlay: Interactive UI to toggle app notifications.",
-        "• Execution: Added 'notif -add/-rem' prompt command.",
-        "• Stability: State serialization preserves app memory.",
-        "• Input: Armored physical touch pipeline.",
-        "• Visuals: Integrated Pixelify Sans font fallback."
+        "• ping [ip]: Test ICMP packet latency."
     )
 
     private var scrollOffset = 0f
@@ -184,18 +180,21 @@ class TerminalView @JvmOverloads constructor(
     private var cachedTotalHeight = 0f
     private val MAX_HISTORY_RENDER_LINES = 150
 
-    // --- SCROLL ENGINES ---
+    // --- RAW HARDWARE SCROLL ENGINE ---
     private var commandScrollOffset = 0f
     private var maxCommandScroll = 0f
     private var lastCommandBarY = 0f
     private var commandBarStartX = 0f
     private var overlayScrollOffset = 0f
+    private var settingsScrollOffset = 0f
 
     // --- BOOT & TOUCH ENGINES ---
     @Volatile private var isBooting = true
-    @Volatile private var isUiTouch = false
     private var touchDownX = 0f
     private var touchDownY = 0f
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+    @Volatile private var isFingerDown = false
 
     private var crtSurfaceView: GLSurfaceView? = null
     private var shaderRenderer: CrtShaderRenderer? = null
@@ -212,7 +211,6 @@ class TerminalView @JvmOverloads constructor(
             val formattedLine = intent?.getStringExtra("formattedLine") ?: return
             val notifId = intent?.getIntExtra("notificationId", -1) ?: -1
 
-            // Notification Firewall Interceptor
             val isAllowed = allowedNotifApps.any { formattedLine.contains(it, ignoreCase = true) }
             if (isAllowed) {
                 activeSession().handleNotification(notifId, formattedLine)
@@ -228,7 +226,7 @@ class TerminalView @JvmOverloads constructor(
         }
 
         override fun onSingleTapUp(e: MotionEvent): Boolean {
-            return false
+            return false // Handled manually to prevent leakages
         }
 
         override fun onDoubleTap(e: MotionEvent): Boolean {
@@ -253,33 +251,6 @@ class TerminalView @JvmOverloads constructor(
                 }
             }
             return false
-        }
-
-        override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
-            if (!isBooting && currentState == AppState.TERMINAL) {
-                if (currentOverlay == OverlayState.NOTIFICATIONS) {
-                    overlayScrollOffset += distanceY
-                    requestUpdate()
-                    return true
-                } else if (currentOverlay == OverlayState.NONE) {
-                    val fontMetrics = textPaint.fontMetrics
-                    val textHeight = fontMetrics.descent - fontMetrics.ascent
-
-                    val isHorizontalPan = abs(distanceX) > abs(distanceY)
-                    if (e1 != null && e1.y > lastCommandBarY - textHeight * 1.5f && e1.y < lastCommandBarY + textHeight * 1.5f && isHorizontalPan) {
-                        val oldOffset = commandScrollOffset
-                        commandScrollOffset = (commandScrollOffset + distanceX).coerceIn(0f, maxCommandScroll)
-                        if (oldOffset != commandScrollOffset) requestUpdate()
-                        return true
-                    } else {
-                        scrollOffset += distanceY
-                        forceScrollToBottom = false
-                        requestUpdate()
-                        return true
-                    }
-                }
-            }
-            return true
         }
     })
 
@@ -306,7 +277,6 @@ class TerminalView @JvmOverloads constructor(
         applyFont()
         applyTheme(TerminalTheme.LUMON)
 
-        // Load persistent settings from disk
         try {
             val aliasFile = File(context.filesDir, "aliases_cache.txt")
             if (aliasFile.exists()) {
@@ -328,6 +298,13 @@ class TerminalView @JvmOverloads constructor(
                 allowedNotifApps.addAll(installedApps.map { it.name })
                 saveNotifSettings()
             }
+
+            val dockFile = File(context.filesDir, "dock_cache.txt")
+            if (dockFile.exists()) {
+                dockFile.readLines().forEach {
+                    if (it.isNotBlank() && dockApps.size < 8) dockApps.add(it.trim())
+                }
+            }
         } catch (e: Exception) {}
 
         startForegroundDaemon()
@@ -347,6 +324,15 @@ class TerminalView @JvmOverloads constructor(
             try {
                 val file = File(context.filesDir, "notifs_cache.txt")
                 file.writeText(allowedNotifApps.joinToString("\n"))
+            } catch (e: Exception) {}
+        }.start()
+    }
+
+    private fun saveDockSettings() {
+        Thread {
+            try {
+                val file = File(context.filesDir, "dock_cache.txt")
+                file.writeText(dockApps.joinToString("\n"))
             } catch (e: Exception) {}
         }.start()
     }
@@ -474,7 +460,7 @@ class TerminalView @JvmOverloads constructor(
             try {
                 val geoUrl = java.net.URL("https://ipapi.co/json/")
                 val geoConn = geoUrl.openConnection() as java.net.HttpURLConnection
-                geoConn.setRequestProperty("User-Agent", "CRTUI-Terminal/0.8")
+                geoConn.setRequestProperty("User-Agent", "CRTUI-Terminal/0.9")
                 geoConn.connectTimeout = 5000
                 geoConn.readTimeout = 5000
 
@@ -532,7 +518,9 @@ class TerminalView @JvmOverloads constructor(
         if (event.action == MotionEvent.ACTION_DOWN) {
             touchDownX = event.x
             touchDownY = event.y
-            isUiTouch = false
+            lastTouchX = event.x
+            lastTouchY = event.y
+            isFingerDown = true
 
             if (isBooting) {
                 isBooting = false
@@ -545,42 +533,72 @@ class TerminalView @JvmOverloads constructor(
 
             if (useCustomKeyboard && currentState == AppState.TERMINAL && currentOverlay == OverlayState.NONE) {
                 if (keyboardEngine.handleTouch(event.x, event.y)) {
-                    isUiTouch = true
                     requestUpdate()
                     return true
                 }
             }
+        } else if (event.action == MotionEvent.ACTION_MOVE) {
+            val dx = lastTouchX - event.x
+            val dy = lastTouchY - event.y
+            lastTouchX = event.x
+            lastTouchY = event.y
 
-            if (currentOverlay != OverlayState.NONE) {
-                if (handleOverlayTap(event.x, event.y)) {
-                    isUiTouch = true
-                    return true
-                }
-            } else if (currentState == AppState.SETTINGS) {
-                if (handleSettingsTap(event.x, event.y)) {
-                    isUiTouch = true
-                    return true
-                }
-            }
-        } else if (event.action == MotionEvent.ACTION_UP) {
-            if (!isUiTouch) {
-                val dx = abs(event.x - touchDownX)
-                val dy = abs(event.y - touchDownY)
-                if (dx < 20f && dy < 20f) {
-                    performClick()
-                    if (!isBooting && currentState == AppState.TERMINAL && currentOverlay == OverlayState.NONE) {
-                        if (handleTap(event.x, event.y)) {
+            if (abs(dx) > 2f || abs(dy) > 2f) {
+                if (!isBooting) {
+                    // Highest priority: Overlay layer routing
+                    if (currentOverlay != OverlayState.NONE) {
+                        overlayScrollOffset += dy
+                        requestUpdate()
+                    }
+                    // Secondary priority: Settings menu layer routing
+                    else if (currentState == AppState.SETTINGS) {
+                        settingsScrollOffset += dy
+                        requestUpdate()
+                    }
+                    // Base priority: Terminal layer routing
+                    else if (currentState == AppState.TERMINAL) {
+                        val fontMetrics = textPaint.fontMetrics
+                        val textHeight = fontMetrics.descent - fontMetrics.ascent
+
+                        if (event.y > lastCommandBarY - textHeight * 1.5f && event.y < lastCommandBarY + textHeight * 1.5f && abs(dx) > abs(dy)) {
+                            commandScrollOffset = (commandScrollOffset + dx).coerceIn(0f, maxCommandScroll)
                             requestUpdate()
-                            return true
+                        } else {
+                            if (abs(dy) > 3f) {
+                                scrollOffset += dy
+                                forceScrollToBottom = false
+                                requestUpdate()
+                            }
                         }
                     }
                 }
-            } else {
-                isUiTouch = false
-                return true
+            }
+
+        } else if (event.action == MotionEvent.ACTION_UP) {
+            isFingerDown = false
+            val totalDx = abs(event.x - touchDownX)
+            val totalDy = abs(event.y - touchDownY)
+
+            if (totalDx < 30f && totalDy < 30f) {
+                performClick()
+                if (!isBooting) {
+                    var tapped = false
+                    if (currentOverlay != OverlayState.NONE) {
+                        tapped = handleOverlayTap(event.x, event.y)
+                    } else if (currentState == AppState.SETTINGS) {
+                        tapped = handleSettingsTap(event.x, event.y)
+                    } else if (currentState == AppState.TERMINAL) {
+                        tapped = handleTap(event.x, event.y)
+                    }
+
+                    if (tapped) {
+                        requestUpdate()
+                        return true
+                    }
+                }
             }
         } else if (event.action == MotionEvent.ACTION_CANCEL) {
-            isUiTouch = false
+            isFingerDown = false
         }
 
         val handled = gestureDetector.onTouchEvent(event)
@@ -776,7 +794,12 @@ class TerminalView @JvmOverloads constructor(
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
 
-        val tabsY = height - paddingBottom - 40f
+        var bottomLimit = height - paddingBottom - 20f
+        if (showIconDock && !isBooting) {
+            bottomLimit -= 100f
+        }
+
+        val tabsY = bottomLimit - 20f
         var commandBarY = tabsY - textHeight - 25f
 
         lastCommandBarY = commandBarY
@@ -801,6 +824,24 @@ class TerminalView @JvmOverloads constructor(
         val headerY = paddingTop + max(40f, textHeight)
         val textTopLimit = headerY + 20f
         val textBottomLimit = if (isBooting) height - paddingBottom - 20f else commandBarY - textHeight - 20f
+
+        if (currentBgOpacity > 0.0f) {
+            try {
+                val bgId = resources.getIdentifier("lumon_globe_logo", "drawable", context.packageName)
+                if (bgId != 0) {
+                    val bgDrawable = context.getDrawable(bgId)
+                    if (bgDrawable != null) {
+                        val size = min(width, height) * 0.7f
+                        val left = (width - size) / 2f
+                        val top = textTopLimit + (textBottomLimit - textTopLimit - size) / 2f
+                        bgDrawable.setBounds(left.toInt(), top.toInt(), (left + size).toInt(), (top + size).toInt())
+                        bgDrawable.alpha = (currentBgOpacity * 255).toInt()
+                        bgDrawable.colorFilter = PorterDuffColorFilter(currentTextColor, PorterDuff.Mode.SRC_IN)
+                        bgDrawable.draw(canvas)
+                    }
+                }
+            } catch(e: Exception) {}
+        }
 
         if (currentState == AppState.SETTINGS && !isBooting) {
             renderSettings(canvas)
@@ -894,14 +935,45 @@ class TerminalView @JvmOverloads constructor(
             }
             drawTabs(canvas, tabsY)
             drawCommandBar(canvas, commandBarY)
+            if (showIconDock) {
+                drawIconDock(canvas, height - paddingBottom - 30f)
+            }
         }
+    }
+
+    private fun drawIconDock(canvas: Canvas, yPos: Float) {
+        val newDockHitboxes = mutableMapOf<String, RectF>()
+
+        canvas.drawLine(paddingLeft + 10f, yPos - 60f, width - paddingRight - 10f, yPos - 60f, tabFramePaint)
+
+        if (dockApps.isEmpty()) {
+            val emptyText = "[ DOCK EMPTY - USE 'dock -add' ]"
+            val eX = (width / 2f) - (promptTextPaint.measureText(emptyText) / 2f)
+            canvas.drawText(emptyText, eX, yPos - 15f, promptTextPaint)
+            dockHitboxes = newDockHitboxes
+            return
+        }
+
+        val spacing = (width - paddingLeft - paddingRight) / max(dockApps.size, 1).toFloat()
+        var currentX = paddingLeft + (spacing / 2f)
+
+        for (appName in dockApps) {
+            val fb = "[ ${appName.take(3).uppercase(Locale.US)} ]"
+            val bX = currentX - (boldTextPaint.measureText(fb) / 2f)
+            canvas.drawText(fb, bX, yPos - 15f, boldTextPaint)
+
+            newDockHitboxes["dock_launch_$appName"] = RectF(currentX - (spacing/2f), yPos - 60f, currentX + (spacing/2f), yPos)
+            currentX += spacing
+        }
+        dockHitboxes = newDockHitboxes
     }
 
     private fun drawOverlayWindow(canvas: Canvas, maxBottomY: Float) {
         val newHitboxes = mutableMapOf<String, RectF>()
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
-        val touchPad = 25f
+        val touchPadX = 40f
+        val touchPadY = 15f
 
         val leftX = paddingLeft + 60f
         val rightX = width - paddingRight - 60f
@@ -917,7 +989,7 @@ class TerminalView @JvmOverloads constructor(
         }
 
         val neededHeight = when (currentOverlay) {
-            OverlayState.MANUAL, OverlayState.NOTIFICATIONS -> (maxBottomY - 20f) - topY
+            OverlayState.MANUAL, OverlayState.NOTIFICATIONS, OverlayState.DOCK_CONFIG -> (maxBottomY - 20f) - topY
             else -> (textHeight * 1.5f) * (itemCount + 3)
         }
 
@@ -932,8 +1004,9 @@ class TerminalView @JvmOverloads constructor(
             OverlayState.NEW_TAB_PROMPT -> " ESTABLISH NEW CONNECTION "
             OverlayState.SSH_HOSTS -> " SECURE SHELL HOSTS "
             OverlayState.ADD_SSH_HOST -> " CONFIGURE NEW HOST "
-            OverlayState.MANUAL -> " USER MANUAL v0.8.0 "
+            OverlayState.MANUAL -> " USER MANUAL v0.9.0 "
             OverlayState.NOTIFICATIONS -> " FIREWALL: NOTIFICATIONS "
+            OverlayState.DOCK_CONFIG -> " DOCK: APPLICATION SELECT "
             else -> " OVERLAY "
         }
         canvas.drawText(title, leftX + 20f, currentY, boldTextPaint)
@@ -943,7 +1016,7 @@ class TerminalView @JvmOverloads constructor(
         val closeX = rightX - closeWidth - 20f
         canvas.drawText(closeText, closeX, currentY, boldTextPaint)
 
-        newHitboxes["close"] = RectF(closeX - touchPad, currentY - textHeight - touchPad, closeX + closeWidth + touchPad, currentY + fontMetrics.descent + touchPad)
+        newHitboxes["close"] = RectF(closeX - touchPadX, currentY - textHeight - touchPadY, closeX + closeWidth + touchPadX, currentY + fontMetrics.descent + touchPadY)
 
         canvas.drawLine(leftX, currentY + fontMetrics.descent, rightX, currentY + fontMetrics.descent, textPaint)
         currentY += textHeight * 1.5f
@@ -953,25 +1026,26 @@ class TerminalView @JvmOverloads constructor(
                 val allowAll = "[ ALLOW ALL ]"
                 val allowNone = "[ ALLOW NONE ]"
                 canvas.drawText(allowAll, leftX + 20f, currentY, boldTextPaint)
-                newHitboxes["allow_all_notifs"] = RectF(leftX + 20f - touchPad, currentY - textHeight - touchPad, leftX + 20f + textPaint.measureText(allowAll) + touchPad, currentY + fontMetrics.descent + touchPad)
+                newHitboxes["allow_all_notifs"] = RectF(leftX + 20f - touchPadX, currentY - textHeight - touchPadY, leftX + 20f + textPaint.measureText(allowAll) + touchPadX, currentY + fontMetrics.descent + touchPadY)
 
                 val noneX = leftX + 60f + textPaint.measureText(allowAll)
                 canvas.drawText(allowNone, noneX, currentY, boldTextPaint)
-                newHitboxes["allow_none_notifs"] = RectF(noneX - touchPad, currentY - textHeight - touchPad, noneX + textPaint.measureText(allowNone) + touchPad, currentY + fontMetrics.descent + touchPad)
+                newHitboxes["allow_none_notifs"] = RectF(noneX - touchPadX, currentY - textHeight - touchPadY, noneX + textPaint.measureText(allowNone) + touchPadX, currentY + fontMetrics.descent + touchPadY)
 
                 currentY += textHeight * 1.5f
                 canvas.drawLine(leftX, currentY - textHeight*0.5f, rightX, currentY - textHeight*0.5f, textPaint)
 
-                val maxOverlayScroll = max(0f, (installedApps.size * textHeight * 1.5f) - (bottomY - currentY))
-                overlayScrollOffset = overlayScrollOffset.coerceIn(0f, maxOverlayScroll)
+                val itemSpacing = textHeight * 2.0f
+                val maxScroll = max(0f, (installedApps.size * itemSpacing) - (bottomY - currentY))
+                overlayScrollOffset = overlayScrollOffset.coerceIn(0f, maxScroll)
 
                 canvas.save()
                 canvas.clipRect(leftX + 5f, currentY - textHeight, rightX - 5f, bottomY - 5f)
                 var listY = currentY - overlayScrollOffset
 
                 for (app in installedApps) {
-                    if (listY > bottomY + textHeight * 2) {
-                        listY += textHeight * 1.5f
+                    if (listY > bottomY + itemSpacing) {
+                        listY += itemSpacing
                         continue
                     }
                     if (listY > currentY - textHeight) {
@@ -985,9 +1059,50 @@ class TerminalView @JvmOverloads constructor(
                         val boxX = rightX - 40f - textPaint.measureText(boxText)
                         canvas.drawText(boxText, boxX, listY, paintToUse)
 
-                        newHitboxes["toggle_notif_${app.name}"] = RectF(leftX, listY - textHeight, rightX, listY + fontMetrics.descent)
+                        newHitboxes["toggle_notif_${app.name}"] = RectF(leftX, listY - textHeight - 5f, rightX, listY + fontMetrics.descent + 5f)
                     }
-                    listY += textHeight * 1.5f
+                    listY += itemSpacing
+                }
+                canvas.restore()
+            }
+            OverlayState.DOCK_CONFIG -> {
+                val clearDock = "[ CLEAR DOCK ]"
+                canvas.drawText(clearDock, leftX + 20f, currentY, boldTextPaint)
+                newHitboxes["clear_dock"] = RectF(leftX + 20f - touchPadX, currentY - textHeight - touchPadY, leftX + 20f + textPaint.measureText(clearDock) + touchPadX, currentY + fontMetrics.descent + touchPadY)
+
+                val countText = "(${dockApps.size}/8 PINNED)"
+                canvas.drawText(countText, rightX - textPaint.measureText(countText) - 20f, currentY, textPaint)
+
+                currentY += textHeight * 1.5f
+                canvas.drawLine(leftX, currentY - textHeight*0.5f, rightX, currentY - textHeight*0.5f, textPaint)
+
+                val itemSpacing = textHeight * 2.0f
+                val maxScroll = max(0f, (installedApps.size * itemSpacing) - (bottomY - currentY))
+                overlayScrollOffset = overlayScrollOffset.coerceIn(0f, maxScroll)
+
+                canvas.save()
+                canvas.clipRect(leftX + 5f, currentY - textHeight, rightX - 5f, bottomY - 5f)
+                var listY = currentY - overlayScrollOffset
+
+                for (app in installedApps) {
+                    if (listY > bottomY + itemSpacing) {
+                        listY += itemSpacing
+                        continue
+                    }
+                    if (listY > currentY - textHeight) {
+                        val appNameStr = "  ${app.name}"
+                        val isPinned = dockApps.contains(app.name)
+                        val boxText = if (isPinned) "[X]" else "[ ]"
+
+                        val paintToUse = if (isPinned) boldTextPaint else textPaint
+                        canvas.drawText(appNameStr, leftX + 20f, listY, paintToUse)
+
+                        val boxX = rightX - 40f - textPaint.measureText(boxText)
+                        canvas.drawText(boxText, boxX, listY, paintToUse)
+
+                        newHitboxes["toggle_dockapp_${app.name}"] = RectF(leftX, listY - textHeight - 5f, rightX, listY + fontMetrics.descent + 5f)
+                    }
+                    listY += itemSpacing
                 }
                 canvas.restore()
             }
@@ -998,7 +1113,7 @@ class TerminalView @JvmOverloads constructor(
                     for (app in favoriteApps) {
                         if (currentY > bottomY - textHeight) break
                         canvas.drawText("  $app", leftX + 20f, currentY, textPaint)
-                        newHitboxes["launch_$app"] = RectF(leftX, currentY - textHeight, rightX, currentY + fontMetrics.descent)
+                        newHitboxes["launch_$app"] = RectF(leftX, currentY - textHeight - 10f, rightX, currentY + fontMetrics.descent + 10f)
                         currentY += textHeight * 1.5f
                     }
                 }
@@ -1006,12 +1121,12 @@ class TerminalView @JvmOverloads constructor(
             OverlayState.NEW_TAB_PROMPT -> {
                 val optLocal = "  [ LOCAL TERMINAL ]"
                 canvas.drawText(optLocal, leftX + 20f, currentY, textPaint)
-                newHitboxes["new_local"] = RectF(leftX, currentY - textHeight, rightX, currentY + fontMetrics.descent)
+                newHitboxes["new_local"] = RectF(leftX, currentY - textHeight - 15f, rightX, currentY + fontMetrics.descent + 15f)
                 currentY += textHeight * 1.5f
 
                 val optRemote = "  [ REMOTE (SSH) TERMINAL ]"
                 canvas.drawText(optRemote, leftX + 20f, currentY, textPaint)
-                newHitboxes["new_remote"] = RectF(leftX, currentY - textHeight, rightX, currentY + fontMetrics.descent)
+                newHitboxes["new_remote"] = RectF(leftX, currentY - textHeight - 15f, rightX, currentY + fontMetrics.descent + 15f)
             }
             OverlayState.SSH_HOSTS -> {
                 if (savedSshHosts.isEmpty()) {
@@ -1033,9 +1148,9 @@ class TerminalView @JvmOverloads constructor(
                         canvas.drawText(delBtn, delX, currentY, boldTextPaint)
                         canvas.drawText(editBtn, editX, currentY, boldTextPaint)
 
-                        newHitboxes["del_ssh_$index"] = RectF(delX - touchPad, currentY - textHeight - touchPad, delX + textPaint.measureText(delBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-                        newHitboxes["edit_ssh_$index"] = RectF(editX - touchPad, currentY - textHeight - touchPad, editX + textPaint.measureText(editBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-                        newHitboxes["connect_ssh_$index"] = RectF(leftX, currentY - textHeight, editX - 10f, currentY + fontMetrics.descent)
+                        newHitboxes["del_ssh_$index"] = RectF(delX - 20f, currentY - textHeight - 15f, delX + textPaint.measureText(delBtn) + 20f, currentY + fontMetrics.descent + 15f)
+                        newHitboxes["edit_ssh_$index"] = RectF(editX - 20f, currentY - textHeight - 15f, editX + textPaint.measureText(editBtn) + 20f, currentY + fontMetrics.descent + 15f)
+                        newHitboxes["connect_ssh_$index"] = RectF(leftX, currentY - textHeight - 15f, editX - 10f, currentY + fontMetrics.descent + 15f)
 
                         currentY += textHeight * 1.5f
                     }
@@ -1044,7 +1159,7 @@ class TerminalView @JvmOverloads constructor(
                 currentY += textHeight * 0.5f
                 val addText = "  [+ ADD NEW HOST]"
                 canvas.drawText(addText, leftX + 20f, currentY, boldTextPaint)
-                newHitboxes["add_ssh"] = RectF(leftX, currentY - textHeight, rightX, currentY + fontMetrics.descent)
+                newHitboxes["add_ssh"] = RectF(leftX, currentY - textHeight - 15f, rightX, currentY + fontMetrics.descent + 15f)
             }
             OverlayState.ADD_SSH_HOST -> {
                 for (i in sshFormLabels.indices) {
@@ -1063,19 +1178,19 @@ class TerminalView @JvmOverloads constructor(
 
                     val paintToUse = if (isActiveField) boldTextPaint else textPaint
                     canvas.drawText(text, leftX + 20f, currentY, paintToUse)
-                    newHitboxes["ssh_field_$i"] = RectF(leftX, currentY - textHeight, rightX, currentY + fontMetrics.descent)
+                    newHitboxes["ssh_field_$i"] = RectF(leftX, currentY - textHeight - 15f, rightX, currentY + fontMetrics.descent + 15f)
                     currentY += textHeight * 1.5f
                 }
 
                 currentY += textHeight * 0.5f
                 val saveBtn = "  [ SAVE ]"
                 canvas.drawText(saveBtn, leftX + 20f, currentY, boldTextPaint)
-                newHitboxes["ssh_save"] = RectF(leftX, currentY - textHeight, leftX + 40f + textPaint.measureText(saveBtn), currentY + fontMetrics.descent)
+                newHitboxes["ssh_save"] = RectF(leftX, currentY - textHeight - 15f, leftX + 40f + textPaint.measureText(saveBtn), currentY + fontMetrics.descent + 15f)
 
                 val cancelBtn = "  [ CANCEL ]"
                 val cancelX = leftX + 60f + textPaint.measureText(saveBtn)
                 canvas.drawText(cancelBtn, cancelX, currentY, boldTextPaint)
-                newHitboxes["ssh_cancel"] = RectF(cancelX - 20f, currentY - textHeight, rightX, currentY + fontMetrics.descent)
+                newHitboxes["ssh_cancel"] = RectF(cancelX - 20f, currentY - textHeight - 15f, rightX, currentY + fontMetrics.descent + 15f)
             }
             OverlayState.MANUAL -> {
                 val manualMaxWidth = rightX - leftX - 40f
@@ -1096,46 +1211,82 @@ class TerminalView @JvmOverloads constructor(
 
     private fun renderSettings(canvas: Canvas) {
         val newSettings = mutableMapOf<String, RectF>()
-        val startX = paddingLeft + 40f
-        var currentY = paddingTop + 100f
+
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
-        val touchPad = 40f
+        val touchPadX = 50f
+        val touchPadY = 20f
+        val lineSpacing = textHeight * 2.5f
+
+        val totalSettingsHeight = (18 + aliases.size) * lineSpacing + 200f
+        val visibleArea = height - paddingTop - paddingBottom
+        val maxScroll = max(0f, totalSettingsHeight - visibleArea)
+        settingsScrollOffset = settingsScrollOffset.coerceIn(0f, maxScroll)
+
+        val startX = paddingLeft + 40f
+        var currentY = paddingTop + 100f - settingsScrollOffset
 
         canvas.drawText("MACRODATA REFINEMENT :: PREFERENCES", startX, currentY, boldTextPaint)
-        currentY += textHeight * 2f
+        currentY += lineSpacing
 
         val themeLabel = "Color Theme: [${currentTheme.name}]  "
         canvas.drawText(themeLabel, startX, currentY, textPaint)
         val cycleBtn = "[ CYCLE ]"
         val cycleX = startX + textPaint.measureText(themeLabel)
         canvas.drawText(cycleBtn, cycleX, currentY, boldTextPaint)
-        newSettings["theme_cycle"] = RectF(cycleX - touchPad, currentY - textHeight - touchPad, cycleX + textPaint.measureText(cycleBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 1.5f
+        newSettings["theme_cycle"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         val fontTypeLabel = "Typeface: [${currentFont.name}]  "
         canvas.drawText(fontTypeLabel, startX, currentY, textPaint)
         val cycleFontBtn = "[ CYCLE ]"
         val cycleFontX = startX + textPaint.measureText(fontTypeLabel)
         canvas.drawText(cycleFontBtn, cycleFontX, currentY, boldTextPaint)
-        newSettings["font_cycle"] = RectF(cycleFontX - touchPad, currentY - textHeight - touchPad, cycleFontX + textPaint.measureText(cycleFontBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 1.5f
+        newSettings["font_cycle"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         val kbdLabel = "Keyboard: "
         canvas.drawText(kbdLabel, startX, currentY, textPaint)
         val kbdBtn = if (useCustomKeyboard) "[ NATIVE ]" else "[ SYSTEM ]"
         val kbdX = startX + textPaint.measureText(kbdLabel)
         canvas.drawText(kbdBtn, kbdX, currentY, boldTextPaint)
-        newSettings["toggle_keyboard"] = RectF(kbdX - touchPad, currentY - textHeight - touchPad, kbdX + textPaint.measureText(kbdBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 1.5f
+        newSettings["toggle_keyboard"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         val notifLabel = "Notifications: "
         canvas.drawText(notifLabel, startX, currentY, textPaint)
         val notifBtn = "[ CONFIGURE ]"
         val notifX = startX + textPaint.measureText(notifLabel)
         canvas.drawText(notifBtn, notifX, currentY, boldTextPaint)
-        newSettings["configure_notifs"] = RectF(notifX - touchPad, currentY - textHeight - touchPad, notifX + textPaint.measureText(notifBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 1.5f
+        newSettings["configure_notifs"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
+
+        val dockLabel = "Icon Dock: "
+        canvas.drawText(dockLabel, startX, currentY, textPaint)
+        val dockConfigBtn = "[ CONFIGURE ]"
+        val dockConfigX = startX + textPaint.measureText(dockLabel)
+        canvas.drawText(dockConfigBtn, dockConfigX, currentY, boldTextPaint)
+        newSettings["configure_dock"] = RectF(startX, currentY - textHeight - 15f, dockConfigX + textPaint.measureText(dockConfigBtn) + 15f, currentY + fontMetrics.descent + 15f)
+
+        val dockShowBtn = if (showIconDock) "[ HIDE ]" else "[ SHOW ]"
+        val dockShowX = dockConfigX + textPaint.measureText(dockConfigBtn) + 30f
+        canvas.drawText(dockShowBtn, dockShowX, currentY, boldTextPaint)
+        newSettings["toggle_dock"] = RectF(dockShowX - 15f, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
+
+        val bgLabel = String.format(Locale.US, "Background Opacity: %.1f  ", currentBgOpacity)
+        canvas.drawText(bgLabel, startX, currentY, textPaint)
+        var btempX = startX + textPaint.measureText(bgLabel)
+
+        val bMinusBtn = "[-] "
+        canvas.drawText(bMinusBtn, btempX, currentY, boldTextPaint)
+        newSettings["bg_minus"] = RectF(btempX - 20f, currentY - textHeight - 15f, btempX + textPaint.measureText(bMinusBtn) + 20f, currentY + fontMetrics.descent + 15f)
+        btempX += textPaint.measureText(bMinusBtn)
+
+        val bPlusBtn = "[+]"
+        canvas.drawText(bPlusBtn, btempX, currentY, boldTextPaint)
+        newSettings["bg_plus"] = RectF(btempX - 20f, currentY - textHeight - 15f, btempX + textPaint.measureText(bPlusBtn) + 20f, currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         val glowLabel = String.format(Locale.US, "Glow Intensity: %.1f  ", currentGlowIntensity)
         canvas.drawText(glowLabel, startX, currentY, textPaint)
@@ -1143,21 +1294,21 @@ class TerminalView @JvmOverloads constructor(
 
         val gMinusBtn = "[-] "
         canvas.drawText(gMinusBtn, tempX, currentY, boldTextPaint)
-        newSettings["glow_minus"] = RectF(tempX - touchPad, currentY - textHeight - touchPad, tempX + textPaint.measureText(gMinusBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
+        newSettings["glow_minus"] = RectF(tempX - 20f, currentY - textHeight - 15f, tempX + textPaint.measureText(gMinusBtn) + 20f, currentY + fontMetrics.descent + 15f)
         tempX += textPaint.measureText(gMinusBtn)
 
         val gPlusBtn = "[+]"
         canvas.drawText(gPlusBtn, tempX, currentY, boldTextPaint)
-        newSettings["glow_plus"] = RectF(tempX - touchPad, currentY - textHeight - touchPad, tempX + textPaint.measureText(gPlusBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 1.5f
+        newSettings["glow_plus"] = RectF(tempX - 20f, currentY - textHeight - 15f, tempX + textPaint.measureText(gPlusBtn) + 20f, currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         val scanlineLabel = "Scanlines: "
         canvas.drawText(scanlineLabel, startX, currentY, textPaint)
         val scanBtn = if (isScanlinesEnabled) "[ ENABLED ]" else "[ DISABLED ]"
         val scanX = startX + textPaint.measureText(scanlineLabel)
         canvas.drawText(scanBtn, scanX, currentY, boldTextPaint)
-        newSettings["toggle_scanlines"] = RectF(scanX - touchPad, currentY - textHeight - touchPad, scanX + textPaint.measureText(scanBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 1.5f
+        newSettings["toggle_scanlines"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         val fontLabel = "Font Size: ${currentTextSize.toInt()}  "
         canvas.drawText(fontLabel, startX, currentY, textPaint)
@@ -1165,30 +1316,30 @@ class TerminalView @JvmOverloads constructor(
 
         val minusBtn = "[-] "
         canvas.drawText(minusBtn, tempX, currentY, boldTextPaint)
-        newSettings["font_minus"] = RectF(tempX - touchPad, currentY - textHeight - touchPad, tempX + textPaint.measureText(minusBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
+        newSettings["font_minus"] = RectF(tempX - 20f, currentY - textHeight - 15f, tempX + textPaint.measureText(minusBtn) + 20f, currentY + fontMetrics.descent + 15f)
         tempX += textPaint.measureText(minusBtn)
 
         val plusBtn = "[+]"
         canvas.drawText(plusBtn, tempX, currentY, boldTextPaint)
-        newSettings["font_plus"] = RectF(tempX - touchPad, currentY - textHeight - touchPad, tempX + textPaint.measureText(plusBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 2.5f
+        newSettings["font_plus"] = RectF(tempX - 20f, currentY - textHeight - 15f, tempX + textPaint.measureText(plusBtn) + 20f, currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         val manualBtn = "[ VIEW SYSTEM MANUAL ]"
         canvas.drawText(manualBtn, startX, currentY, boldTextPaint)
-        newSettings["open_manual"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(manualBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 1.5f
+        newSettings["open_manual"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         val exportBtn = "[ EXPORT SETTINGS ]"
         canvas.drawText(exportBtn, startX, currentY, boldTextPaint)
-        newSettings["export"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(exportBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 3f
+        newSettings["export"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         canvas.drawText("--- MACRO ALIASES ---", startX, currentY, boldTextPaint)
-        currentY += textHeight * 1.5f
+        currentY += lineSpacing
 
         if (aliases.isEmpty()) {
             canvas.drawText("(No aliases defined)", startX, currentY, textPaint)
-            currentY += textHeight * 1.5f
+            currentY += lineSpacing
         } else {
             for ((key, cmd) in aliases) {
                 val aliasText = "$key -> $cmd  "
@@ -1197,25 +1348,25 @@ class TerminalView @JvmOverloads constructor(
                 val delX = startX + textPaint.measureText(aliasText)
                 val delBtn = "[X]"
                 canvas.drawText(delBtn, delX, currentY, boldTextPaint)
-                newSettings["delete_alias_$key"] = RectF(delX - touchPad, currentY - textHeight - touchPad, delX + textPaint.measureText(delBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
+                newSettings["delete_alias_$key"] = RectF(delX - 20f, currentY - textHeight - 15f, delX + textPaint.measureText(delBtn) + 20f, currentY + fontMetrics.descent + 15f)
 
-                currentY += textHeight * 1.5f
+                currentY += lineSpacing
             }
         }
 
         val addBtn = "[+ ADD ALIAS]"
         canvas.drawText(addBtn, startX, currentY, boldTextPaint)
-        newSettings["add_alias"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(addBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 3f
+        newSettings["add_alias"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
-        val repoText = "VERSION v0.8.0 :: [ GitHub: exolon/CRTUI ]"
+        val repoText = "VERSION v0.9.0 :: [ GitHub: exolon/CRTUI ]"
         canvas.drawText(repoText, startX, currentY, promptTextPaint)
-        newSettings["github_link"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(repoText) + touchPad, currentY + fontMetrics.descent + touchPad)
-        currentY += textHeight * 3f
+        newSettings["github_link"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
+        currentY += lineSpacing
 
         val exitBtn = "[ EXIT SETTINGS ]"
         canvas.drawText(exitBtn, startX, currentY, boldTextPaint)
-        newSettings["exit"] = RectF(startX - touchPad, currentY - textHeight - touchPad, startX + textPaint.measureText(exitBtn) + touchPad, currentY + fontMetrics.descent + touchPad)
+        newSettings["exit"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
 
         settingsHitboxes = newSettings
     }
@@ -1424,7 +1575,7 @@ class TerminalView @JvmOverloads constructor(
                     val topAlias = aliases.keys.find { it.lowercase().contains(filterText) }
                     if (topAlias != null) {
                         session.history.add(session.getPrompt() + topAlias)
-                        CommandEngine.process(context, session, aliases[topAlias]!!, installedApps, aliases, favoriteApps, allowedNotifApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings) { post(it) }
+                        CommandEngine.process(context, session, aliases[topAlias]!!, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
                         currentCommandMode = CommandMode.NORMAL
                     }
                     session.buffer = ""
@@ -1433,7 +1584,7 @@ class TerminalView @JvmOverloads constructor(
                     if (session.type == SessionType.LOCAL) {
                         session.history.add(session.getPrompt() + session.buffer)
                     }
-                    val shouldClear = CommandEngine.process(context, session, session.buffer, installedApps, aliases, favoriteApps, allowedNotifApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings) { post(it) }
+                    val shouldClear = CommandEngine.process(context, session, session.buffer, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
                     if (shouldClear) {
                         session.buffer = ""
                         session.cursor = 0
@@ -1540,7 +1691,7 @@ class TerminalView @JvmOverloads constructor(
 
     private fun exportSettings() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R &&
-            context.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            context.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             (context as? android.app.Activity)?.requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), 112)
             activeSession().history.add("> Requesting storage permission. Please accept and try again.")
             scrollToBottom()
@@ -1587,6 +1738,24 @@ class TerminalView @JvmOverloads constructor(
         for ((action, rect) in overlayHitboxes) {
             if (rect.contains(touchX, touchY)) {
                 when (currentOverlay) {
+                    OverlayState.DOCK_CONFIG -> {
+                        if (action == "close") {
+                            currentOverlay = OverlayState.NONE
+                        } else if (action == "clear_dock") {
+                            dockApps.clear()
+                            saveDockSettings()
+                        } else if (action.startsWith("toggle_dockapp_")) {
+                            val appName = action.removePrefix("toggle_dockapp_")
+                            if (dockApps.contains(appName)) {
+                                dockApps.remove(appName)
+                            } else {
+                                if (dockApps.size < 8) {
+                                    dockApps.add(appName)
+                                }
+                            }
+                            saveDockSettings()
+                        }
+                    }
                     OverlayState.NOTIFICATIONS -> {
                         if (action == "close") {
                             currentOverlay = OverlayState.NONE
@@ -1736,6 +1905,23 @@ class TerminalView @JvmOverloads constructor(
                         overlayScrollOffset = 0f
                         currentOverlay = OverlayState.NOTIFICATIONS
                     }
+                    action == "configure_dock" -> {
+                        overlayScrollOffset = 0f
+                        currentOverlay = OverlayState.DOCK_CONFIG
+                    }
+                    action == "toggle_dock" -> {
+                        showIconDock = !showIconDock
+                    }
+                    action == "bg_minus" -> {
+                        if (currentBgOpacity > 0.0f) {
+                            currentBgOpacity = max(0f, currentBgOpacity - 0.1f)
+                        }
+                    }
+                    action == "bg_plus" -> {
+                        if (currentBgOpacity < 1.0f) {
+                            currentBgOpacity = min(1.0f, currentBgOpacity + 0.1f)
+                        }
+                    }
                     action == "glow_minus" -> {
                         if (currentGlowIntensity > 0.0f) {
                             currentGlowIntensity = max(0f, currentGlowIntensity - 0.1f)
@@ -1823,6 +2009,17 @@ class TerminalView @JvmOverloads constructor(
             return true
         }
 
+        if (showIconDock && dockApps.isNotEmpty()) {
+            for ((action, rect) in dockHitboxes) {
+                if (rect.contains(touchX, touchY)) {
+                    if (action.startsWith("dock_launch_")) {
+                        launchApp(action.removePrefix("dock_launch_"))
+                        return true
+                    }
+                }
+            }
+        }
+
         val session = activeSession()
 
         if (!useCustomKeyboard) {
@@ -1865,6 +2062,11 @@ class TerminalView @JvmOverloads constructor(
                         val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
                         imm.hideSoftInputFromWindow(windowToken, 0)
                     }
+                    currentCommandMode == CommandMode.NORMAL -> {
+                        launchApp(commandString)
+                        session.buffer = ""
+                        session.cursor = 0
+                    }
                     currentCommandMode == CommandMode.APPS -> {
                         launchApp(commandString)
                         session.buffer = ""
@@ -1875,7 +2077,7 @@ class TerminalView @JvmOverloads constructor(
                         val mappedCmd = aliases[commandString]
                         if (mappedCmd != null) {
                             session.history.add(session.getPrompt() + commandString)
-                            CommandEngine.process(context, session, mappedCmd, installedApps, aliases, favoriteApps, allowedNotifApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings) { post(it) }
+                            CommandEngine.process(context, session, mappedCmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
                         }
                         session.buffer = ""
                         session.cursor = 0
@@ -1884,7 +2086,7 @@ class TerminalView @JvmOverloads constructor(
                     currentCommandMode == CommandMode.SYS -> {
                         val cmd = commandString.lowercase()
                         session.history.add(session.getPrompt() + cmd)
-                        CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, allowedNotifApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings) { post(it) }
+                        CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
                         session.buffer = ""
                         session.cursor = 0
                         currentCommandMode = CommandMode.NORMAL
@@ -1892,7 +2094,7 @@ class TerminalView @JvmOverloads constructor(
                     currentCommandMode == CommandMode.NET -> {
                         val cmd = if (commandString == "PING") "ping 8.8.8.8" else commandString.lowercase()
                         session.history.add(session.getPrompt() + cmd)
-                        CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, allowedNotifApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings) { post(it) }
+                        CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
                         session.buffer = ""
                         session.cursor = 0
                         currentCommandMode = CommandMode.NORMAL

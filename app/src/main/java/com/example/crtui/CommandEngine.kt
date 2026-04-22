@@ -28,11 +28,13 @@ object CommandEngine {
         aliases: MutableMap<String, String>,
         favoriteApps: MutableList<String>,
         allowedNotifApps: MutableSet<String>,
+        dockApps: MutableList<String>,
         launchApp: (String) -> Unit,
         openSettings: () -> Unit,
         scrollToBottom: () -> Unit,
         requestUpdate: () -> Unit,
         saveNotifs: () -> Unit,
+        saveDock: () -> Unit,
         onMainThread: (() -> Unit) -> Unit
     ): Boolean {
         val args = input.trim().split("\\s+".toRegex())
@@ -43,11 +45,11 @@ object CommandEngine {
             if (session.type == SessionType.LOCAL) {
                 session.history.add("> executing alias: $cmd -> $mappedCmd")
             }
-            return process(context, session, mappedCmd, installedApps, aliases, favoriteApps, allowedNotifApps, launchApp, openSettings, scrollToBottom, requestUpdate, saveNotifs, onMainThread)
+            return process(context, session, mappedCmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, launchApp, openSettings, scrollToBottom, requestUpdate, saveNotifs, saveDock, onMainThread)
         }
 
         if (session.type == SessionType.SSH) {
-            if (cmd == "clear" || cmd == "settings" || cmd == "alias" || cmd == "exit" || cmd == "changelog" || cmd == "notif") {
+            if (cmd == "clear" || cmd == "settings" || cmd == "alias" || cmd == "exit" || cmd == "changelog" || cmd == "notif" || cmd == "dock") {
                 if (cmd == "exit") {
                     session.disconnectSsh()
                     session.history.add("> Terminated remote connection.")
@@ -67,13 +69,12 @@ object CommandEngine {
             "clear" -> session.clearHistory()
 
             "changelog" -> {
-                session.history.add("> CHANGELOG v0.8.0")
-                session.history.add("• Telemetry: Added robust Notification Firewall engine.")
-                session.history.add("• Overlays: Scrollable TUI menu to allow/block specific app notifications.")
-                session.history.add("• Engine: Added 'notif -add/-rem' command for terminal management.")
-                session.history.add("• Stability: Custom aliases & notif lists safely serialized to disk.")
-                session.history.add("• Memory: Resolved fatal crash-loop in Foreground Service module.")
-                session.history.add("• Typography: Added custom Pixelify Sans font integration.")
+                session.history.add("> CHANGELOG v0.9.0")
+                session.history.add("• Dock: Custom minimal Quick Launch Dock (max 8 apps) via 'dock -add'.")
+                session.history.add("• Telemetry: Notification Firewall with UI toggle and 'notif' cmd.")
+                session.history.add("• Scroll Engine: Raw hardware touch pipeline for flawless scrolling.")
+                session.history.add("• Visuals: Adjustable vector background logo opacity in Settings.")
+                session.history.add("• Settings: Expanded hitboxes and dedicated overlay scroll engine.")
             }
 
             "settings" -> {
@@ -115,6 +116,40 @@ object CommandEngine {
                     }
                 } else {
                     session.history.add("Syntax error. Use: alias name=command")
+                }
+            }
+
+            "dock" -> {
+                if (args.size > 2) {
+                    val action = args[1].lowercase(Locale.US)
+                    val appNameQuery = input.substringAfter(args[1]).trim()
+
+                    val match = installedApps.find { it.name.equals(appNameQuery, ignoreCase = true) }
+                        ?: installedApps.find { it.name.startsWith(appNameQuery, ignoreCase = true) }
+
+                    val finalName = match?.name ?: appNameQuery
+
+                    if (action == "-add") {
+                        if (dockApps.size >= 8 && !dockApps.contains(finalName)) {
+                            session.history.add("> Dock full. Remove an app first (max 8).")
+                        } else {
+                            if (!dockApps.contains(finalName)) dockApps.add(finalName)
+                            session.history.add("> Pinned to Dock: $finalName")
+                            saveDock()
+                        }
+                    } else if (action == "-rem" || action == "-rm") {
+                        val removed = dockApps.remove(finalName)
+                        if (!removed) {
+                            val toRemove = dockApps.find { it.equals(finalName, ignoreCase = true) }
+                            if (toRemove != null) dockApps.remove(toRemove)
+                        }
+                        session.history.add("> Removed from Dock: $finalName")
+                        saveDock()
+                    } else {
+                        session.history.add("Syntax error. Use: dock -add/-rem <app>")
+                    }
+                } else {
+                    session.history.add("Syntax error. Use: dock -add/-rem <app>")
                 }
             }
 

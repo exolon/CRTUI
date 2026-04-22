@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.crtui"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.8"
+        versionCode = 5
+        versionName = "0.9"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
