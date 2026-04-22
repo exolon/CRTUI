@@ -27,18 +27,30 @@ class TerminalSession(var name: String, val type: SessionType, val sshConfig: Ss
 
     private val ansiRegex = Regex("\u001B\\[[;\\d?]*[a-zA-Z]")
 
-    // Maps Notification IDs to their specific line in the history array for live updating
     private val notifIndexMap = ConcurrentHashMap<Int, Int>()
+    private val notifThrottleMap = ConcurrentHashMap<Int, Long>()
 
     fun getPrompt(): String {
         return if (type == SessionType.LOCAL) "LOCAL // ${cwd.name} > " else "${sshConfig?.user}@${sshConfig?.host} > "
     }
 
     fun handleNotification(id: Int, line: String) {
+        val now = System.currentTimeMillis()
+
+        // Throttling Engine: Silences aggressive persistent notifications (like VPNs/Media)
+        // by locking updates for a specific ID to a maximum of once every 2.5 seconds.
+        if (id != -1 && notifThrottleMap.containsKey(id)) {
+            if (now - notifThrottleMap[id]!! < 2500) return
+        }
+
+        if (id != -1) notifThrottleMap[id] = now
+
         if (id != -1 && notifIndexMap.containsKey(id)) {
             val index = notifIndexMap[id]!!
             if (index < history.size) {
-                history[index] = line
+                if (history[index] != line) {
+                    history[index] = line
+                }
                 return
             }
         }
@@ -51,6 +63,7 @@ class TerminalSession(var name: String, val type: SessionType, val sshConfig: Ss
     fun clearHistory() {
         history.clear()
         notifIndexMap.clear()
+        notifThrottleMap.clear()
     }
 
     fun connectSsh(onUpdate: () -> Unit) {

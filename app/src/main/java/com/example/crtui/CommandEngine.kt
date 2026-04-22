@@ -27,10 +27,12 @@ object CommandEngine {
         installedApps: List<TerminalView.AppInfo>,
         aliases: MutableMap<String, String>,
         favoriteApps: MutableList<String>,
+        allowedNotifApps: MutableSet<String>,
         launchApp: (String) -> Unit,
         openSettings: () -> Unit,
         scrollToBottom: () -> Unit,
         requestUpdate: () -> Unit,
+        saveNotifs: () -> Unit,
         onMainThread: (() -> Unit) -> Unit
     ): Boolean {
         val args = input.trim().split("\\s+".toRegex())
@@ -41,11 +43,11 @@ object CommandEngine {
             if (session.type == SessionType.LOCAL) {
                 session.history.add("> executing alias: $cmd -> $mappedCmd")
             }
-            return process(context, session, mappedCmd, installedApps, aliases, favoriteApps, launchApp, openSettings, scrollToBottom, requestUpdate, onMainThread)
+            return process(context, session, mappedCmd, installedApps, aliases, favoriteApps, allowedNotifApps, launchApp, openSettings, scrollToBottom, requestUpdate, saveNotifs, onMainThread)
         }
 
         if (session.type == SessionType.SSH) {
-            if (cmd == "clear" || cmd == "settings" || cmd == "alias" || cmd == "exit" || cmd == "changelog") {
+            if (cmd == "clear" || cmd == "settings" || cmd == "alias" || cmd == "exit" || cmd == "changelog" || cmd == "notif") {
                 if (cmd == "exit") {
                     session.disconnectSsh()
                     session.history.add("> Terminated remote connection.")
@@ -65,10 +67,13 @@ object CommandEngine {
             "clear" -> session.clearHistory()
 
             "changelog" -> {
-                session.history.add("> CHANGELOG v0.7.1")
-                session.history.add("• Architecture: Decoupled logic into CommandEngine.kt.")
-                session.history.add("• Optimization: Frustum Culling completely cures UI freeze.")
-                session.history.add("• Input: Removed gesture-leakage dropping keyboard taps.")
+                session.history.add("> CHANGELOG v0.8.0")
+                session.history.add("• Telemetry: Added robust Notification Firewall engine.")
+                session.history.add("• Overlays: Scrollable TUI menu to allow/block specific app notifications.")
+                session.history.add("• Engine: Added 'notif -add/-rem' command for terminal management.")
+                session.history.add("• Stability: Custom aliases & notif lists safely serialized to disk.")
+                session.history.add("• Memory: Resolved fatal crash-loop in Foreground Service module.")
+                session.history.add("• Typography: Added custom Pixelify Sans font integration.")
             }
 
             "settings" -> {
@@ -89,6 +94,57 @@ object CommandEngine {
                     }
                 } else {
                     session.history.add("Syntax error. Use: s [query]")
+                }
+            }
+
+            "alias" -> {
+                if (args.size > 1 && input.contains("=")) {
+                    val mapping = input.substringAfter("alias ").trim()
+                    val key = mapping.substringBefore("=").trim()
+                    val value = mapping.substringAfter("=").trim()
+
+                    if (key.isNotEmpty() && value.isNotEmpty()) {
+                        aliases[key] = value
+                        try {
+                            val file = File(context.filesDir, "aliases_cache.txt")
+                            file.writeText(aliases.entries.joinToString("\n") { "${it.key}=${it.value}" })
+                        } catch (e: Exception) {}
+                        session.history.add("Alias saved: $key -> $value")
+                    } else {
+                        session.history.add("Syntax error. Use: alias name=command")
+                    }
+                } else {
+                    session.history.add("Syntax error. Use: alias name=command")
+                }
+            }
+
+            "notif" -> {
+                if (args.size > 2) {
+                    val action = args[1].lowercase(Locale.US)
+                    val appNameQuery = input.substringAfter(args[1]).trim()
+
+                    val match = installedApps.find { it.name.equals(appNameQuery, ignoreCase = true) }
+                        ?: installedApps.find { it.name.startsWith(appNameQuery, ignoreCase = true) }
+
+                    val finalName = match?.name ?: appNameQuery
+
+                    if (action == "-add") {
+                        allowedNotifApps.add(finalName)
+                        session.history.add("> Notifications ALLOWED for: $finalName")
+                        saveNotifs()
+                    } else if (action == "-rem" || action == "-rm") {
+                        val removed = allowedNotifApps.remove(finalName)
+                        if (!removed) {
+                            val toRemove = allowedNotifApps.find { it.equals(finalName, ignoreCase = true) }
+                            if (toRemove != null) allowedNotifApps.remove(toRemove)
+                        }
+                        session.history.add("> Notifications MUTED for: $finalName")
+                        saveNotifs()
+                    } else {
+                        session.history.add("Syntax error. Use: notif -add/-rem <app>")
+                    }
+                } else {
+                    session.history.add("Syntax error. Use: notif -add/-rem <app>")
                 }
             }
 
