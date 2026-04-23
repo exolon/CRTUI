@@ -67,7 +67,7 @@ class TerminalView @JvmOverloads constructor(
     private var currentTheme = TerminalTheme.LUMON
     private var currentFont = TerminalFont.GLASS_TTY
     private var currentTextColor = Color.parseColor("#00E5FF")
-    private var currentTextSize = 37f
+    private var currentTextSize = 28f
     private var currentGlowIntensity = 0.6f
     private var currentBgOpacity = 0.2f
     private var isScanlinesEnabled = true
@@ -145,8 +145,12 @@ class TerminalView @JvmOverloads constructor(
     private val favoriteApps = CopyOnWriteArrayList<String>()
     private val aliases = ConcurrentHashMap<String, String>()
 
-    // --- FIREWALL & DOCK ENGINES ---
+    // --- HISTORY, FIREWALL & DOCK ENGINES ---
+    private val commandHistory = mutableListOf<String>()
+    private var historyIndex = -1
+
     private val allowedNotifApps = ConcurrentHashMap.newKeySet<String>()
+    private val recentNotifs = mutableMapOf<String, Long>()
     private val dockApps = CopyOnWriteArrayList<String>()
 
     private val savedSshHosts = CopyOnWriteArrayList<SshConfig>()
@@ -200,6 +204,7 @@ class TerminalView @JvmOverloads constructor(
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     @Volatile private var isFingerDown = false
+    private var isReceiverRegistered = false
 
     private var crtSurfaceView: GLSurfaceView? = null
     private var shaderRenderer: CrtShaderRenderer? = null
@@ -218,8 +223,21 @@ class TerminalView @JvmOverloads constructor(
             val formattedLine = intent?.getStringExtra("formattedLine") ?: return
             val notifId = intent?.getIntExtra("notificationId", -1) ?: -1
 
-            val isAllowed = allowedNotifApps.any { formattedLine.contains(it, ignoreCase = true) }
-            if (isAllowed) {
+            // Debounce rapid duplicate notifications from Android
+            val now = System.currentTimeMillis()
+            recentNotifs.entries.retainAll { now - it.value < 5000 }
+            if (recentNotifs.containsKey(formattedLine)) return
+            recentNotifs[formattedLine] = now
+
+            // Stricter app matching: must prefix the text to avoid substring collisions
+            val isAllowed = allowedNotifApps.any { app ->
+                formattedLine.startsWith(app, ignoreCase = true) ||
+                        formattedLine.startsWith("[$app]", ignoreCase = true) ||
+                        formattedLine.contains("$app:", ignoreCase = true) ||
+                        formattedLine.contains(" $app ", ignoreCase = true)
+            }
+
+            if (isAllowed || allowedNotifApps.isEmpty()) {
                 activeSession().handleNotification(notifId, formattedLine)
                 scrollToBottom()
                 requestUpdate()
@@ -332,7 +350,7 @@ class TerminalView @JvmOverloads constructor(
         val savedFont = prefs.getInt("font", TerminalFont.GLASS_TTY.ordinal)
         currentFont = TerminalFont.values()[savedFont]
 
-        currentTextSize = prefs.getFloat("textSize", 37f)
+        currentTextSize = prefs.getFloat("textSize", 28f)
         currentGlowIntensity = prefs.getFloat("glowIntensity", 0.6f)
         currentBgOpacity = prefs.getFloat("bgOpacity", 0.2f)
         isScanlinesEnabled = prefs.getBoolean("scanlines", true)
@@ -733,17 +751,23 @@ class TerminalView @JvmOverloads constructor(
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        val filter = IntentFilter("com.example.crtui.NOTIFICATION_EVENT")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(notificationReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            context.registerReceiver(notificationReceiver, filter)
+        if (!isReceiverRegistered) {
+            val filter = IntentFilter("com.example.crtui.NOTIFICATION_EVENT")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(notificationReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                context.registerReceiver(notificationReceiver, filter)
+            }
+            isReceiverRegistered = true
         }
     }
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
-        context.unregisterReceiver(notificationReceiver)
+        if (isReceiverRegistered) {
+            context.unregisterReceiver(notificationReceiver)
+            isReceiverRegistered = false
+        }
         removeCallbacks(cursorPulseRunnable)
     }
 
@@ -845,7 +869,6 @@ class TerminalView @JvmOverloads constructor(
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
 
-        // Ensure space is explicitly reserved if the dock is toggled on, even if empty, to prevent overlap
         var bottomLimit = height - paddingBottom - 20f
         if (showIconDock && !isBooting) {
             bottomLimit -= 100f
@@ -1014,7 +1037,7 @@ class TerminalView @JvmOverloads constructor(
             val lowerName = appName.lowercase(Locale.US)
             val drawableId = when {
                 lowerName.contains("phone") || lowerName.contains("dial") || lowerName.contains("call") -> android.R.drawable.ic_menu_call
-                lowerName.contains("message") || lowerName.contains("sms") || lowerName.contains("text") || lowerName.contains("whatsapp") || lowerName.contains("chat") -> android.R.drawable.sym_action_email
+                lowerName.contains("message") || lowerName.contains("sms") || lowerName.contains("text") || lowerName.contains("whatsapp") || lowerName.contains("viber") || lowerName.contains("signal") || lowerName.contains("chat") -> android.R.drawable.sym_action_email
                 lowerName.contains("chrome") || lowerName.contains("browser") || lowerName.contains("web") || lowerName.contains("internet") || lowerName.contains("brave") || lowerName.contains("firefox") || lowerName.contains("duck") -> android.R.drawable.ic_menu_mapmode
                 lowerName.contains("camera") || lowerName.contains("photo") || lowerName.contains("gallery") -> android.R.drawable.ic_menu_camera
                 lowerName.contains("setting") || lowerName.contains("config") -> android.R.drawable.ic_menu_manage
@@ -1025,7 +1048,8 @@ class TerminalView @JvmOverloads constructor(
                 lowerName.contains("clock") || lowerName.contains("alarm") || lowerName.contains("time") -> android.R.drawable.ic_menu_recent_history
                 lowerName.contains("calendar") -> android.R.drawable.ic_menu_month
                 lowerName.contains("contact") -> android.R.drawable.ic_menu_myplaces
-                else -> android.R.drawable.ic_menu_sort_by_size
+                lowerName.contains("gemini") || lowerName.contains("ai") || lowerName.contains("gpt") -> android.R.drawable.ic_menu_info_details
+                else -> android.R.drawable.sym_def_app_icon
             }
 
             try {
@@ -1434,7 +1458,7 @@ class TerminalView @JvmOverloads constructor(
         newSettings["add_alias"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
         currentY += lineSpacing
 
-        val repoText = "VERSION v0.9.1 :: [ GitHub: exolon/CRTUI ]"
+        val repoText = "VERSION :: [ GitHub: exolon/CRTUI ]"
         canvas.drawText(repoText, startX, currentY, promptTextPaint)
         newSettings["github_link"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
         currentY += lineSpacing
@@ -1636,6 +1660,12 @@ class TerminalView @JvmOverloads constructor(
         } else {
             val session = activeSession()
             if (session.buffer.isNotBlank()) {
+                val cmdToSave = session.buffer.trim()
+                if (commandHistory.isEmpty() || commandHistory.last() != cmdToSave) {
+                    commandHistory.add(cmdToSave)
+                }
+                historyIndex = commandHistory.size
+
                 if (currentCommandMode == CommandMode.APPS) {
                     val filterText = session.buffer.lowercase().trim()
                     var matches = installedApps.filter { it.name.lowercase() == filterText }
@@ -1702,12 +1732,25 @@ class TerminalView @JvmOverloads constructor(
             "<" -> session.cursor = max(0, session.cursor - 1)
             ">" -> session.cursor = min(session.buffer.length, session.cursor + 1)
             "^" -> {
-                scrollOffset += 200f
-                forceScrollToBottom = false
+                if (commandHistory.isNotEmpty()) {
+                    historyIndex = max(0, historyIndex - 1)
+                    session.buffer = commandHistory[historyIndex]
+                    session.cursor = session.buffer.length
+                    forceScrollToBottom = true
+                }
             }
             "v" -> {
-                scrollOffset = (scrollOffset - 200f).coerceAtLeast(0f)
-                forceScrollToBottom = false
+                if (commandHistory.isNotEmpty()) {
+                    if (historyIndex < commandHistory.size - 1) {
+                        historyIndex++
+                        session.buffer = commandHistory[historyIndex]
+                    } else {
+                        historyIndex = commandHistory.size
+                        session.buffer = ""
+                    }
+                    session.cursor = session.buffer.length
+                    forceScrollToBottom = true
+                }
             }
             else -> injectChar(keyId)
         }
