@@ -71,6 +71,7 @@ class TerminalView @JvmOverloads constructor(
     private var currentGlowIntensity = 0.6f
     private var currentBgOpacity = 0.2f
     private var isScanlinesEnabled = true
+    private var showIconDock = true
 
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = currentTextColor
@@ -136,7 +137,10 @@ class TerminalView @JvmOverloads constructor(
     @Volatile private var dockHitboxes: Map<String, RectF> = emptyMap()
 
     data class AppInfo(val name: String, val packageName: String)
+    data class ContactInfo(val name: String, val number: String)
+
     private val installedApps = mutableListOf<AppInfo>()
+    private val cachedContacts = mutableListOf<ContactInfo>()
 
     private val favoriteApps = CopyOnWriteArrayList<String>()
     private val aliases = ConcurrentHashMap<String, String>()
@@ -144,19 +148,20 @@ class TerminalView @JvmOverloads constructor(
     // --- FIREWALL & DOCK ENGINES ---
     private val allowedNotifApps = ConcurrentHashMap.newKeySet<String>()
     private val dockApps = CopyOnWriteArrayList<String>()
-    private var showIconDock = true
 
     private val savedSshHosts = CopyOnWriteArrayList<SshConfig>()
+    private val builtinCmds = listOf("clear", "settings", "changelog", "s", "g", "alias", "dock", "notif", "mem", "bat", "vol", "brt", "bt", "ip", "pwd", "ls", "cd", "mkdir", "rm", "note", "read", "dnd", "wifi", "ping", "call", "fav")
 
     private val manualLines = listOf(
         "<bold>INTERFACE & NAVIGATION</bold>",
         "• Tabs: Double-tap to close. Tap [+] for new session.",
         "• Overlays: Tap [Favs] for Favorites, [*] for Settings.",
-        "• Suggest: Swipe command bar to scroll results.",
+        "• Suggest: Start typing to auto-filter the command bar.",
         "• Scroll: Drag terminal to view history.",
         " ",
         "<bold>CORE COMMANDS</bold>",
-        "• s [query]: System-wide web search.",
+        "• s/g [query]: System-wide web search.",
+        "• call [name]: Instantly filter and dial local contacts.",
         "• dock -add/rm: Add app shortcuts to main icon dock.",
         "• notif -add/rm: Add app to Notification Firewall whitelist.",
         "• alias x=y: Map custom execution macros.",
@@ -198,6 +203,8 @@ class TerminalView @JvmOverloads constructor(
 
     private var crtSurfaceView: GLSurfaceView? = null
     private var shaderRenderer: CrtShaderRenderer? = null
+
+    private val prefs by lazy { context.getSharedPreferences("CRTUI_PREFS", Context.MODE_PRIVATE) }
 
     private val cursorPulseRunnable = object : Runnable {
         override fun run() {
@@ -274,8 +281,7 @@ class TerminalView @JvmOverloads constructor(
 
         loadInstalledApps()
         fetchWeather()
-        applyFont()
-        applyTheme(TerminalTheme.LUMON)
+        loadPreferences()
 
         try {
             val aliasFile = File(context.filesDir, "aliases_cache.txt")
@@ -317,6 +323,46 @@ class TerminalView @JvmOverloads constructor(
         }
 
         post(cursorPulseRunnable)
+    }
+
+    private fun loadPreferences() {
+        val savedTheme = prefs.getInt("theme", TerminalTheme.LUMON.ordinal)
+        currentTheme = TerminalTheme.values()[savedTheme]
+
+        val savedFont = prefs.getInt("font", TerminalFont.GLASS_TTY.ordinal)
+        currentFont = TerminalFont.values()[savedFont]
+
+        currentTextSize = prefs.getFloat("textSize", 37f)
+        currentGlowIntensity = prefs.getFloat("glowIntensity", 0.6f)
+        currentBgOpacity = prefs.getFloat("bgOpacity", 0.2f)
+        isScanlinesEnabled = prefs.getBoolean("scanlines", true)
+        useCustomKeyboard = prefs.getBoolean("customKeyboard", true)
+        showIconDock = prefs.getBoolean("showDock", true)
+
+        applyFont()
+        applyTheme(currentTheme)
+    }
+
+    private fun requestContactsSync() {
+        if (context.checkSelfPermission(android.Manifest.permission.READ_CONTACTS) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            Thread {
+                try {
+                    val cursor = context.contentResolver.query(android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI, null, null, null, null)
+                    cursor?.use {
+                        val nameIdx = it.getColumnIndex(android.provider.ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                        val numIdx = it.getColumnIndex(android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER)
+                        val tempContacts = mutableListOf<ContactInfo>()
+                        while (it.moveToNext()) {
+                            tempContacts.add(ContactInfo(it.getString(nameIdx), it.getString(numIdx)))
+                        }
+                        cachedContacts.clear()
+                        cachedContacts.addAll(tempContacts)
+                    }
+                } catch(e: Exception){}
+            }.start()
+        } else {
+            (context as? android.app.Activity)?.requestPermissions(arrayOf(android.Manifest.permission.READ_CONTACTS), 113)
+        }
     }
 
     private fun saveNotifSettings() {
@@ -386,30 +432,35 @@ class TerminalView @JvmOverloads constructor(
             }
 
             val logo = listOf(
-                "      .-------------------------------.",
-                "   .+###################################+.",
-                "  -#######################################-",
-                " .#########################################.",
-                " -###################. .+##################-",
-                " -#################+.   .+#################-",
-                " +################+.     .+################-",
-                " +###############+.       .+###############-",
-                " -##############+.         .+##############-",
-                " +#############+.           .+#############-",
-                " +#############-             .#############-",
-                " -#############.             .#############-",
-                " +#############-             -#############-",
-                " +##############-           -##############-",
-                " -###############+-.      -+###############-",
-                " .#########################################.",
-                "  -#######################################-",
-                "   .+###################################+.",
-                "      .-+++++++++++++++++++++++++++++-.",
-                ""
+                "                                    ",
+                "                                    ",
+                "                                    ",
+                "      ..--------------------..      ",
+                "    .##########################.    ",
+                "   .############################.   ",
+                "   .############+..+############.   ",
+                "   .###########+.  .-###########.   ",
+                "   .##########-.    .-##########.   ",
+                "   .#########-.      .-#########.   ",
+                "   .#########.        .#########.   ",
+                "   .#########-        .#########.   ",
+                "   .##########-.    .-##########.   ",
+                "   .############################.   ",
+                "    .##########################.    ",
+                "      ..--------------------..      ",
+                "                                    ",
+                "                                    ",
+                "                                    "
             )
 
+            var appVersion = "0.9.1"
+            try {
+                val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+                appVersion = pInfo.versionName ?: "0.9.1"
+            } catch(e: Exception){}
+
             val steps = listOf(
-                "EAGAN_OS v1.4 ... INITIALIZING",
+                "EAGAN_OS v$appVersion ... INITIALIZING",
                 "MEMORY CHECK ........................ OK",
                 "LOADING MACRODATA MODULE ............ OK",
                 "MOUNTING /dev/local ................. OK",
@@ -794,6 +845,7 @@ class TerminalView @JvmOverloads constructor(
         val fontMetrics = textPaint.fontMetrics
         val textHeight = fontMetrics.descent - fontMetrics.ascent
 
+        // Ensure space is explicitly reserved if the dock is toggled on, even if empty, to prevent overlap
         var bottomLimit = height - paddingBottom - 20f
         if (showIconDock && !isBooting) {
             bottomLimit -= 100f
@@ -947,22 +999,45 @@ class TerminalView @JvmOverloads constructor(
         canvas.drawLine(paddingLeft + 10f, yPos - 60f, width - paddingRight - 10f, yPos - 60f, tabFramePaint)
 
         if (dockApps.isEmpty()) {
-            val emptyText = "[ DOCK EMPTY - USE 'dock -add' ]"
+            val emptyText = "[ DOCK EMPTY - USE 'dock -add' OR SETTINGS ]"
             val eX = (width / 2f) - (promptTextPaint.measureText(emptyText) / 2f)
             canvas.drawText(emptyText, eX, yPos - 15f, promptTextPaint)
             dockHitboxes = newDockHitboxes
             return
         }
 
+        val iconSize = 60f
         val spacing = (width - paddingLeft - paddingRight) / max(dockApps.size, 1).toFloat()
         var currentX = paddingLeft + (spacing / 2f)
 
         for (appName in dockApps) {
-            val fb = "[ ${appName.take(3).uppercase(Locale.US)} ]"
-            val bX = currentX - (boldTextPaint.measureText(fb) / 2f)
-            canvas.drawText(fb, bX, yPos - 15f, boldTextPaint)
+            val lowerName = appName.lowercase(Locale.US)
+            val drawableId = when {
+                lowerName.contains("phone") || lowerName.contains("dial") || lowerName.contains("call") -> android.R.drawable.ic_menu_call
+                lowerName.contains("message") || lowerName.contains("sms") || lowerName.contains("text") || lowerName.contains("whatsapp") || lowerName.contains("chat") -> android.R.drawable.sym_action_email
+                lowerName.contains("chrome") || lowerName.contains("browser") || lowerName.contains("web") || lowerName.contains("internet") || lowerName.contains("brave") || lowerName.contains("firefox") || lowerName.contains("duck") -> android.R.drawable.ic_menu_mapmode
+                lowerName.contains("camera") || lowerName.contains("photo") || lowerName.contains("gallery") -> android.R.drawable.ic_menu_camera
+                lowerName.contains("setting") || lowerName.contains("config") -> android.R.drawable.ic_menu_manage
+                lowerName.contains("mail") || lowerName.contains("gmail") -> android.R.drawable.sym_action_email
+                lowerName.contains("map") || lowerName.contains("nav") || lowerName.contains("maps") -> android.R.drawable.ic_dialog_map
+                lowerName.contains("music") || lowerName.contains("spotify") || lowerName.contains("audio") || lowerName.contains("podcast") -> android.R.drawable.ic_media_play
+                lowerName.contains("calc") -> android.R.drawable.ic_menu_agenda
+                lowerName.contains("clock") || lowerName.contains("alarm") || lowerName.contains("time") -> android.R.drawable.ic_menu_recent_history
+                lowerName.contains("calendar") -> android.R.drawable.ic_menu_month
+                lowerName.contains("contact") -> android.R.drawable.ic_menu_myplaces
+                else -> android.R.drawable.ic_menu_sort_by_size
+            }
 
-            newDockHitboxes["dock_launch_$appName"] = RectF(currentX - (spacing/2f), yPos - 60f, currentX + (spacing/2f), yPos)
+            try {
+                val d = context.getDrawable(drawableId)
+                if (d != null) {
+                    d.setBounds((currentX - (iconSize/2f)).toInt(), (yPos - iconSize).toInt(), (currentX + (iconSize/2f)).toInt(), yPos.toInt())
+                    d.colorFilter = PorterDuffColorFilter(currentTextColor, PorterDuff.Mode.SRC_IN)
+                    d.draw(canvas)
+                }
+            } catch(e: Exception){}
+
+            newDockHitboxes["dock_launch_$appName"] = RectF(currentX - (spacing/2f), yPos - 80f, currentX + (spacing/2f), yPos)
             currentX += spacing
         }
         dockHitboxes = newDockHitboxes
@@ -1004,7 +1079,7 @@ class TerminalView @JvmOverloads constructor(
             OverlayState.NEW_TAB_PROMPT -> " ESTABLISH NEW CONNECTION "
             OverlayState.SSH_HOSTS -> " SECURE SHELL HOSTS "
             OverlayState.ADD_SSH_HOST -> " CONFIGURE NEW HOST "
-            OverlayState.MANUAL -> " USER MANUAL v0.9.0 "
+            OverlayState.MANUAL -> " USER MANUAL v0.9.1 "
             OverlayState.NOTIFICATIONS -> " FIREWALL: NOTIFICATIONS "
             OverlayState.DOCK_CONFIG -> " DOCK: APPLICATION SELECT "
             else -> " OVERLAY "
@@ -1359,7 +1434,7 @@ class TerminalView @JvmOverloads constructor(
         newSettings["add_alias"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
         currentY += lineSpacing
 
-        val repoText = "VERSION v0.9.0 :: [ GitHub: exolon/CRTUI ]"
+        val repoText = "VERSION v0.9.1 :: [ GitHub: exolon/CRTUI ]"
         canvas.drawText(repoText, startX, currentY, promptTextPaint)
         newSettings["github_link"] = RectF(startX, currentY - textHeight - 15f, width.toFloat(), currentY + fontMetrics.descent + 15f)
         currentY += lineSpacing
@@ -1435,26 +1510,40 @@ class TerminalView @JvmOverloads constructor(
         var currentX = paddingLeft + 40f
         val touchPad = 10f
 
-        val itemsToDraw = when (currentCommandMode) {
-            CommandMode.NORMAL -> listOf("Apps", "Favs", "Alias", "Sys", "Net")
-            CommandMode.APPS -> {
-                val filterText = activeSession().buffer.lowercase()
-                installedApps.filter { it.name.lowercase().contains(filterText) }.take(50).map { it.name }
+        val q = activeSession().buffer.lowercase(Locale.US)
+
+        val itemsToDraw = if (q.isNotEmpty()) {
+            if (q.startsWith("call ")) {
+                val cq = q.substringAfter("call ").trim()
+                if (cq.isNotEmpty()) {
+                    cachedContacts.filter { it.name.lowercase(Locale.US).contains(cq) }.map { it.name }.distinct().take(20)
+                } else {
+                    cachedContacts.map { it.name }.distinct().take(20)
+                }
+            } else {
+                val appMatches = installedApps.filter { it.name.lowercase(Locale.US).contains(q) }.map { it.name }
+                val aliasMatches = aliases.keys.filter { it.lowercase(Locale.US).contains(q) }
+                val cmdMatches = builtinCmds.filter { it.contains(q) }
+                (appMatches + aliasMatches + cmdMatches).take(20)
             }
-            CommandMode.ALIASES -> {
-                val filterText = activeSession().buffer.lowercase()
-                aliases.keys.filter { it.lowercase().contains(filterText) }.take(50).toList()
+        } else {
+            when (currentCommandMode) {
+                CommandMode.NORMAL -> listOf("Apps", "Favs", "Alias", "Sys", "Net")
+                CommandMode.APPS -> installedApps.take(50).map { it.name }
+                CommandMode.ALIASES -> aliases.keys.take(50).toList()
+                CommandMode.SYS -> listOf("MEM", "BAT", "DND", "VOL", "BRT")
+                CommandMode.NET -> listOf("IP", "WIFI", "BT", "PING")
             }
-            CommandMode.SYS -> listOf("MEM", "BAT", "DND", "VOL", "BRT")
-            CommandMode.NET -> listOf("IP", "WIFI", "BT", "PING")
         }
 
-        val rowPrefix = when (currentCommandMode) {
-            CommandMode.NORMAL -> "CMD: "
-            CommandMode.APPS -> "APP: "
-            CommandMode.ALIASES -> "ALS: "
-            CommandMode.SYS -> "SYS: "
-            CommandMode.NET -> "NET: "
+        val rowPrefix = if (q.isNotEmpty()) "SUGGEST: " else {
+            when (currentCommandMode) {
+                CommandMode.NORMAL -> "CMD: "
+                CommandMode.APPS -> "APP: "
+                CommandMode.ALIASES -> "ALS: "
+                CommandMode.SYS -> "SYS: "
+                CommandMode.NET -> "NET: "
+            }
         }
 
         canvas.drawText(rowPrefix, currentX, commandBarY, promptTextPaint)
@@ -1509,9 +1598,12 @@ class TerminalView @JvmOverloads constructor(
             session.buffer = left + text + right
             session.cursor += text.length
 
-            if (currentCommandMode == CommandMode.APPS || currentCommandMode == CommandMode.ALIASES) {
-                commandScrollOffset = 0f
+            commandScrollOffset = 0f
+
+            if (session.buffer.lowercase(Locale.US).startsWith("call ")) {
+                requestContactsSync()
             }
+
             scrollToBottom()
         }
     }
@@ -1532,9 +1624,7 @@ class TerminalView @JvmOverloads constructor(
                 if (session.buffer.isEmpty() && currentCommandMode != CommandMode.NORMAL) {
                     currentCommandMode = CommandMode.NORMAL
                 }
-                if (currentCommandMode == CommandMode.APPS || currentCommandMode == CommandMode.ALIASES) {
-                    commandScrollOffset = 0f
-                }
+                commandScrollOffset = 0f
                 scrollToBottom()
             }
         }
@@ -1575,7 +1665,7 @@ class TerminalView @JvmOverloads constructor(
                     val topAlias = aliases.keys.find { it.lowercase().contains(filterText) }
                     if (topAlias != null) {
                         session.history.add(session.getPrompt() + topAlias)
-                        CommandEngine.process(context, session, aliases[topAlias]!!, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
+                        CommandEngine.process(context, session, aliases[topAlias]!!, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, cachedContacts, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
                         currentCommandMode = CommandMode.NORMAL
                     }
                     session.buffer = ""
@@ -1584,7 +1674,7 @@ class TerminalView @JvmOverloads constructor(
                     if (session.type == SessionType.LOCAL) {
                         session.history.add(session.getPrompt() + session.buffer)
                     }
-                    val shouldClear = CommandEngine.process(context, session, session.buffer, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
+                    val shouldClear = CommandEngine.process(context, session, session.buffer, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, cachedContacts, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
                     if (shouldClear) {
                         session.buffer = ""
                         session.cursor = 0
@@ -1893,13 +1983,16 @@ class TerminalView @JvmOverloads constructor(
                     action == "theme_cycle" -> {
                         val nextTheme = TerminalTheme.values()[(currentTheme.ordinal + 1) % TerminalTheme.values().size]
                         applyTheme(nextTheme)
+                        prefs.edit().putInt("theme", nextTheme.ordinal).apply()
                     }
                     action == "font_cycle" -> {
                         currentFont = if (currentFont == TerminalFont.GLASS_TTY) TerminalFont.PIXELIFY else TerminalFont.GLASS_TTY
                         applyFont()
+                        prefs.edit().putInt("font", currentFont.ordinal).apply()
                     }
                     action == "toggle_keyboard" -> {
                         useCustomKeyboard = !useCustomKeyboard
+                        prefs.edit().putBoolean("customKeyboard", useCustomKeyboard).apply()
                     }
                     action == "configure_notifs" -> {
                         overlayScrollOffset = 0f
@@ -1911,43 +2004,51 @@ class TerminalView @JvmOverloads constructor(
                     }
                     action == "toggle_dock" -> {
                         showIconDock = !showIconDock
+                        prefs.edit().putBoolean("showDock", showIconDock).apply()
                     }
                     action == "bg_minus" -> {
                         if (currentBgOpacity > 0.0f) {
                             currentBgOpacity = max(0f, currentBgOpacity - 0.1f)
+                            prefs.edit().putFloat("bgOpacity", currentBgOpacity).apply()
                         }
                     }
                     action == "bg_plus" -> {
                         if (currentBgOpacity < 1.0f) {
                             currentBgOpacity = min(1.0f, currentBgOpacity + 0.1f)
+                            prefs.edit().putFloat("bgOpacity", currentBgOpacity).apply()
                         }
                     }
                     action == "glow_minus" -> {
                         if (currentGlowIntensity > 0.0f) {
                             currentGlowIntensity = max(0f, currentGlowIntensity - 0.1f)
                             shaderRenderer?.glowIntensity = currentGlowIntensity
+                            prefs.edit().putFloat("glowIntensity", currentGlowIntensity).apply()
                         }
                     }
                     action == "glow_plus" -> {
                         if (currentGlowIntensity < 2.0f) {
                             currentGlowIntensity = min(2.0f, currentGlowIntensity + 0.1f)
                             shaderRenderer?.glowIntensity = currentGlowIntensity
+                            prefs.edit().putFloat("glowIntensity", currentGlowIntensity).apply()
                         }
                     }
                     action == "toggle_scanlines" -> {
                         isScanlinesEnabled = !isScanlinesEnabled
                         shaderRenderer?.isScanlinesEnabled = isScanlinesEnabled
+                        prefs.edit().putBoolean("scanlines", isScanlinesEnabled).apply()
                     }
                     action == "font_minus" -> {
                         if (currentTextSize > 20f) {
                             currentTextSize -= 2f
                             updatePaintSizes()
+                            prefs.edit().putFloat("textSize", currentTextSize).apply()
                         }
                     }
                     action == "font_plus" -> {
                         if (currentTextSize < 80f) {
                             currentTextSize += 2f
                             updatePaintSizes()
+                            prefs.edit().putFloat("textSize", currentTextSize).apply()
                         }
                     }
                     action == "open_manual" -> {
@@ -2042,62 +2143,99 @@ class TerminalView @JvmOverloads constructor(
 
         for ((commandString, rect) in commandHitboxes) {
             if (rect.contains(touchX, touchY)) {
-                when {
-                    currentCommandMode == CommandMode.NORMAL && commandString == "Apps" -> {
-                        currentCommandMode = CommandMode.APPS
-                        commandScrollOffset = 0f
-                    }
-                    currentCommandMode == CommandMode.NORMAL && commandString == "Alias" -> {
-                        currentCommandMode = CommandMode.ALIASES
-                        commandScrollOffset = 0f
-                    }
-                    currentCommandMode == CommandMode.NORMAL && commandString == "Sys" -> {
-                        currentCommandMode = CommandMode.SYS
-                    }
-                    currentCommandMode == CommandMode.NORMAL && commandString == "Net" -> {
-                        currentCommandMode = CommandMode.NET
-                    }
-                    currentCommandMode == CommandMode.NORMAL && commandString == "Favs" -> {
-                        currentOverlay = OverlayState.FAVORITES
-                        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                        imm.hideSoftInputFromWindow(windowToken, 0)
-                    }
-                    currentCommandMode == CommandMode.NORMAL -> {
-                        launchApp(commandString)
-                        session.buffer = ""
-                        session.cursor = 0
-                    }
-                    currentCommandMode == CommandMode.APPS -> {
-                        launchApp(commandString)
-                        session.buffer = ""
-                        session.cursor = 0
-                        currentCommandMode = CommandMode.NORMAL
-                    }
-                    currentCommandMode == CommandMode.ALIASES -> {
-                        val mappedCmd = aliases[commandString]
-                        if (mappedCmd != null) {
-                            session.history.add(session.getPrompt() + commandString)
-                            CommandEngine.process(context, session, mappedCmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
+                if (session.buffer.lowercase(Locale.US).startsWith("call ")) {
+                    val matchingContacts = cachedContacts.filter { it.name == commandString }
+                    if (matchingContacts.isNotEmpty()) {
+                        if (matchingContacts.size == 1) {
+                            try {
+                                val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${matchingContacts[0].number}"))
+                                context.startActivity(intent)
+                                session.history.add("> Calling ${matchingContacts[0].name}...")
+                            } catch(e: Exception){}
+                        } else {
+                            val numbers = matchingContacts.map { it.number }.toTypedArray()
+                            android.app.AlertDialog.Builder(context)
+                                .setTitle("Select number for $commandString")
+                                .setItems(numbers) { _, which ->
+                                    try {
+                                        val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${numbers[which]}"))
+                                        context.startActivity(intent)
+                                        session.history.add("> Calling $commandString...")
+                                        requestUpdate()
+                                    } catch(e: Exception){}
+                                }
+                                .show()
                         }
                         session.buffer = ""
                         session.cursor = 0
-                        currentCommandMode = CommandMode.NORMAL
                     }
-                    currentCommandMode == CommandMode.SYS -> {
-                        val cmd = commandString.lowercase()
-                        session.history.add(session.getPrompt() + cmd)
-                        CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
+                } else if (session.buffer.isNotEmpty()) {
+                    if (installedApps.any { it.name == commandString }) {
+                        launchApp(commandString)
                         session.buffer = ""
                         session.cursor = 0
-                        currentCommandMode = CommandMode.NORMAL
+                    } else {
+                        session.buffer = commandString + " "
+                        session.cursor = session.buffer.length
                     }
-                    currentCommandMode == CommandMode.NET -> {
-                        val cmd = if (commandString == "PING") "ping 8.8.8.8" else commandString.lowercase()
-                        session.history.add(session.getPrompt() + cmd)
-                        CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
-                        session.buffer = ""
-                        session.cursor = 0
-                        currentCommandMode = CommandMode.NORMAL
+                } else {
+                    when {
+                        currentCommandMode == CommandMode.NORMAL && commandString == "Apps" -> {
+                            currentCommandMode = CommandMode.APPS
+                            commandScrollOffset = 0f
+                        }
+                        currentCommandMode == CommandMode.NORMAL && commandString == "Alias" -> {
+                            currentCommandMode = CommandMode.ALIASES
+                            commandScrollOffset = 0f
+                        }
+                        currentCommandMode == CommandMode.NORMAL && commandString == "Sys" -> {
+                            currentCommandMode = CommandMode.SYS
+                        }
+                        currentCommandMode == CommandMode.NORMAL && commandString == "Net" -> {
+                            currentCommandMode = CommandMode.NET
+                        }
+                        currentCommandMode == CommandMode.NORMAL && commandString == "Favs" -> {
+                            currentOverlay = OverlayState.FAVORITES
+                            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                            imm.hideSoftInputFromWindow(windowToken, 0)
+                        }
+                        currentCommandMode == CommandMode.NORMAL -> {
+                            launchApp(commandString)
+                            session.buffer = ""
+                            session.cursor = 0
+                        }
+                        currentCommandMode == CommandMode.APPS -> {
+                            launchApp(commandString)
+                            session.buffer = ""
+                            session.cursor = 0
+                            currentCommandMode = CommandMode.NORMAL
+                        }
+                        currentCommandMode == CommandMode.ALIASES -> {
+                            val mappedCmd = aliases[commandString]
+                            if (mappedCmd != null) {
+                                session.history.add(session.getPrompt() + commandString)
+                                CommandEngine.process(context, session, mappedCmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, cachedContacts, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
+                            }
+                            session.buffer = ""
+                            session.cursor = 0
+                            currentCommandMode = CommandMode.NORMAL
+                        }
+                        currentCommandMode == CommandMode.SYS -> {
+                            val cmd = commandString.lowercase()
+                            session.history.add(session.getPrompt() + cmd)
+                            CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, cachedContacts, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
+                            session.buffer = ""
+                            session.cursor = 0
+                            currentCommandMode = CommandMode.NORMAL
+                        }
+                        currentCommandMode == CommandMode.NET -> {
+                            val cmd = if (commandString == "PING") "ping 8.8.8.8" else commandString.lowercase()
+                            session.history.add(session.getPrompt() + cmd)
+                            CommandEngine.process(context, session, cmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, cachedContacts, ::launchApp, { currentState = AppState.SETTINGS; val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager; imm.hideSoftInputFromWindow(windowToken, 0) }, ::scrollToBottom, ::requestUpdate, ::saveNotifSettings, ::saveDockSettings) { post(it) }
+                            session.buffer = ""
+                            session.cursor = 0
+                            currentCommandMode = CommandMode.NORMAL
+                        }
                     }
                 }
                 requestUpdate()

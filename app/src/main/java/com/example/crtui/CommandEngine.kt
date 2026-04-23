@@ -29,6 +29,7 @@ object CommandEngine {
         favoriteApps: MutableList<String>,
         allowedNotifApps: MutableSet<String>,
         dockApps: MutableList<String>,
+        cachedContacts: List<TerminalView.ContactInfo>,
         launchApp: (String) -> Unit,
         openSettings: () -> Unit,
         scrollToBottom: () -> Unit,
@@ -45,7 +46,7 @@ object CommandEngine {
             if (session.type == SessionType.LOCAL) {
                 session.history.add("> executing alias: $cmd -> $mappedCmd")
             }
-            return process(context, session, mappedCmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, launchApp, openSettings, scrollToBottom, requestUpdate, saveNotifs, saveDock, onMainThread)
+            return process(context, session, mappedCmd, installedApps, aliases, favoriteApps, allowedNotifApps, dockApps, cachedContacts, launchApp, openSettings, scrollToBottom, requestUpdate, saveNotifs, saveDock, onMainThread)
         }
 
         if (session.type == SessionType.SSH) {
@@ -69,20 +70,24 @@ object CommandEngine {
             "clear" -> session.clearHistory()
 
             "changelog" -> {
-                session.history.add("> CHANGELOG v0.9.0")
-                session.history.add("• Dock: Custom minimal Quick Launch Dock (max 8 apps) via 'dock -add'.")
-                session.history.add("• Telemetry: Notification Firewall with UI toggle and 'notif' cmd.")
-                session.history.add("• Scroll Engine: Raw hardware touch pipeline for flawless scrolling.")
-                session.history.add("• Visuals: Adjustable vector background logo opacity in Settings.")
-                session.history.add("• Settings: Expanded hitboxes and dedicated overlay scroll engine.")
+                session.history.add("> CHANGELOG v0.9.1")
+                session.history.add("• Telemetry: Real-time predictive autocomplete on Command Bar.")
+                session.history.add("• Telemetry: 'call' command integrated with native OS Contact routing.")
+                session.history.add("• UI: Dynamic CP437 block-character boot sequence integrated.")
+                session.history.add("• UI: Native quick-launch icon dock added (manage via 'dock' or settings).")
+                session.history.add("• Engine: Raw-pixel hardware scroll logic deployed to fix touch leakage.")
+                session.history.add("• Security: Configurable Notification Firewall with visual TUI toggles.")
+                session.history.add("• Stability: Keep-Alive service deployed to stop background OS memory wipes.")
+                session.history.add("• Settings: Theme and visual prefs permanently locked via SharedPreferences.")
             }
 
             "settings" -> {
                 openSettings()
             }
 
-            "s" -> {
-                val query = input.substringAfter("s ").trim()
+            "s", "g" -> {
+                val prefix = if (cmd == "s") "s " else "g "
+                val query = input.substringAfter(prefix).trim()
                 if (query.isNotEmpty()) {
                     val intent = Intent(Intent.ACTION_WEB_SEARCH).apply { putExtra(SearchManager.QUERY, query) }
                     try {
@@ -94,7 +99,52 @@ object CommandEngine {
                         session.history.add("> Searching (Browser fallback): $query")
                     }
                 } else {
-                    session.history.add("Syntax error. Use: s [query]")
+                    session.history.add("Syntax error. Use: $cmd [query]")
+                }
+            }
+
+            "call" -> {
+                if (args.size > 1) {
+                    val target = input.substringAfter("call ").trim()
+                    val matchingContacts = cachedContacts.filter { it.name.equals(target, ignoreCase = true) }
+
+                    if (matchingContacts.isNotEmpty()) {
+                        if (matchingContacts.size == 1) {
+                            session.history.add("> Dialing contact: ${matchingContacts[0].name}...")
+                            try {
+                                val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${matchingContacts[0].number}"))
+                                context.startActivity(intent)
+                            } catch (e: Exception) {
+                                session.history.add("> Error launching dialer.")
+                            }
+                        } else {
+                            onMainThread {
+                                val numbers = matchingContacts.map { it.number }.toTypedArray()
+                                android.app.AlertDialog.Builder(context)
+                                    .setTitle("Select number for ${matchingContacts[0].name}")
+                                    .setItems(numbers) { _, which ->
+                                        try {
+                                            session.history.add("> Dialing contact: ${matchingContacts[0].name}...")
+                                            val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${numbers[which]}"))
+                                            context.startActivity(intent)
+                                            scrollToBottom()
+                                            requestUpdate()
+                                        } catch (e: Exception) {}
+                                    }
+                                    .show()
+                            }
+                        }
+                    } else {
+                        session.history.add("> Dialing raw number: $target...")
+                        try {
+                            val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$target"))
+                            context.startActivity(intent)
+                        } catch (e: Exception) {
+                            session.history.add("> Error launching dialer.")
+                        }
+                    }
+                } else {
+                    session.history.add("Syntax error. Use: call [name/number]")
                 }
             }
 
